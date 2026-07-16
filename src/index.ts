@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { parseFile, summaryToMarkdown } from "./services/ast-parser.js";
 import { getFileDiff } from "./services/git-diff.js";
 import { runReviewPipeline } from "./services/ai-orchestrator.js";
+import { PROVIDER_IDS, type ProviderId } from "./utils/model-factory.js";
 
 const program = new Command();
 
@@ -40,7 +41,12 @@ program
     "Run the code-reviewer and security-auditor AI agents against a file's diff",
   )
   .argument("<file>", "path to the TypeScript file to review")
-  .action(async (file: string) => {
+  .addOption(
+    new Option("--provider <type>", "AI provider to use for the review agents")
+      .choices(PROVIDER_IDS)
+      .default("anthropic"),
+  )
+  .action(async (file: string, options: { provider: ProviderId }) => {
     try {
       const astContext = summaryToMarkdown(parseFile(file));
       const diff = getFileDiff(file);
@@ -48,6 +54,7 @@ program
         filePath: file,
         astContext,
         diff,
+        provider: options.provider,
       });
 
       console.log("\n=== Code Reviewer ===\n");

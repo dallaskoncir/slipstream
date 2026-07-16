@@ -1,8 +1,6 @@
-import { generateText } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
+import { generateText, type LanguageModel } from "ai";
 import { loadPersonaPrompt, type PersonaPrompt } from "./prompt-loader.js";
-
-const MODEL_ID = process.env.SLIPSTREAM_MODEL ?? "claude-sonnet-5";
+import { createModel, type ProviderId } from "../utils/model-factory.js";
 
 // Bounds how much file content and model output a single review can consume, so a
 // huge or generated input file can't blow up token cost or hang on context limits.
@@ -13,6 +11,7 @@ export interface ReviewInput {
   filePath: string;
   astContext: string;
   diff: string;
+  provider: ProviderId;
 }
 
 export interface ReviewResult {
@@ -52,9 +51,13 @@ function buildUserPrompt(input: ReviewInput, priorFindings?: string): string {
   return sections.join("\n");
 }
 
-async function runPersona(persona: PersonaPrompt, userPrompt: string): Promise<string> {
+async function runPersona(
+  model: LanguageModel,
+  persona: PersonaPrompt,
+  userPrompt: string,
+): Promise<string> {
   const { text } = await generateText({
-    model: anthropic(MODEL_ID),
+    model,
     system: persona.systemPrompt,
     prompt: userPrompt,
     maxOutputTokens: MAX_OUTPUT_TOKENS,
@@ -63,13 +66,17 @@ async function runPersona(persona: PersonaPrompt, userPrompt: string): Promise<s
 }
 
 export async function runReviewPipeline(input: ReviewInput): Promise<ReviewResult> {
+  console.error(`slipstream: using provider "${input.provider}"`);
+
+  const model = createModel(input.provider);
   const [codeReviewer, securityAuditor] = await Promise.all([
     loadPersonaPrompt("code-reviewer"),
     loadPersonaPrompt("security-auditor"),
   ]);
 
-  const codeReview = await runPersona(codeReviewer, buildUserPrompt(input));
+  const codeReview = await runPersona(model, codeReviewer, buildUserPrompt(input));
   const securityAudit = await runPersona(
+    model,
     securityAuditor,
     buildUserPrompt(input, codeReview),
   );

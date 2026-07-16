@@ -10,7 +10,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -24,6 +24,7 @@
     "commander": "^13.1.0",
     "dotenv": "^16.4.7",
     "isolated-vm": "6.1.2",
+    "ollama-ai-provider-v2": "4.0.1",
     "ts-morph": "^25.0.1"
   },
   "devDependencies": {
