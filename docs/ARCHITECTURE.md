@@ -13,7 +13,8 @@ Slipstream doesn't ask one model "is this file okay?" and print the answer. It r
                                 │  exported functions, imports, interfaces
                                 ▼
                      ┌─────────────────────┐
-  git diff      ────► │  context assembly    │  secrets scrubbed before
+                     │                       │
+  git diff      ────►│  context assembly     │  secrets scrubbed before
                      │  (+ secret scrub)     │  anything leaves your machine
                      └──────────┬───────────┘
                                 │
