@@ -6,24 +6,33 @@ export interface RepoSlug {
 }
 
 /**
- * Parses `owner/repo` out of the `origin` remote, supporting both SSH
+ * Parses `owner/repo` out of a GitHub remote URL, supporting both SSH
  * (`git@github.com:owner/repo.git`) and HTTPS
- * (`https://github.com/owner/repo.git`) forms.
+ * (`https://github.com/owner/repo.git`) forms, with or without the `.git`
+ * suffix. Exported (not just used internally) so the parsing logic is
+ * testable without shelling out to git.
  */
-export function getRepoSlugFromGit(): RepoSlug | undefined {
-  let url: string;
-  try {
-    url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf-8" }).trim();
-  } catch {
-    return undefined;
-  }
-
-  const match = url.match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/);
+export function parseGitHubRemote(url: string): RepoSlug | undefined {
+  const match = url.trim().match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/);
   if (!match) {
     return undefined;
   }
   const [, owner, repo] = match;
   return owner && repo ? { owner, repo } : undefined;
+}
+
+/**
+ * Reads the `origin` remote via `git remote get-url` and parses it into
+ * `owner/repo`.
+ */
+export function getRepoSlugFromGit(): RepoSlug | undefined {
+  let url: string;
+  try {
+    url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf-8" });
+  } catch {
+    return undefined;
+  }
+  return parseGitHubRemote(url);
 }
 
 export interface PostPrCommentOptions {

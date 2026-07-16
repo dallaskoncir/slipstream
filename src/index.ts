@@ -135,15 +135,23 @@ program
         },
       ]);
 
+      const deliveries: string[] = [];
+
       if (options.output) {
         await writeFile(options.output, reportMarkdown, "utf-8");
-        clack.outro(`Report written to ${options.output}`);
-      } else if (githubTarget) {
+        deliveries.push(`written to ${options.output}`);
+      }
+
+      if (githubTarget) {
         const { url } = await postPrComment({ ...githubTarget, body: reportMarkdown });
-        clack.outro(`Report posted: ${url}`);
-      } else {
+        deliveries.push(`posted to ${url}`);
+      }
+
+      if (deliveries.length === 0) {
         clack.outro("Review complete");
         console.log(`\n${reportMarkdown}`);
+      } else {
+        clack.outro(`Report ${deliveries.join(" and ")}`);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
