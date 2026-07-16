@@ -78,11 +78,13 @@ The ASCII-art data-flow diagram in `docs/ARCHITECTURE.md` is hand-drawn and frag
 
 ## Phase 8: Prompt Caching for Token Efficiency
 
-The AST context + diff (up to 40K chars) and the persona system prompts are currently resent in full on every one of the three model calls in a single `review` run. Use Anthropic prompt caching (`@ai-sdk/anthropic`'s `providerOptions.anthropic.cacheControl`) so the shared system prompt and AST/diff content are cached, and later calls in the same run read from cache instead of paying full input price.
+The AST context + diff (up to 40K chars) is currently resent in full on every one of the three model calls in a single `review` run — a real intra-run duplication, since the code-review and test-generation prompts share an identical AST+diff prefix, and the security-audit prompt reuses that same prefix with the code-review findings appended after it. The code-reviewer and security-auditor persona system prompts (from `prompt-loader.ts`), by contrast, are each used only *once* per run — call 1 uses the code-reviewer prompt, call 2 uses the security-auditor prompt, and call 3 (test generation) uses its own hardcoded `TEST_GENERATOR_SYSTEM_PROMPT` in `ai-orchestrator.ts`, not a persona prompt at all — so caching those pays off only *across* separate `slipstream review` invocations within the cache TTL (e.g. reviewing several files back to back), not within a single run.
+
+Use Anthropic prompt caching (`@ai-sdk/anthropic`'s `providerOptions.anthropic.cacheControl`) to capture both wins:
 
 1. Create a new branch for Phase 8.
-2. In `src/services/ai-orchestrator.ts`, mark the persona system prompt and the AST-context/diff portion of the user prompt as cacheable (`cacheControl: { type: "ephemeral" }`) via `providerOptions.anthropic`.
+2. In `src/services/ai-orchestrator.ts`, mark the AST-context/diff portion of the user prompt as cacheable (`cacheControl: { type: "ephemeral" }`) via `providerOptions.anthropic` on all three calls — this is the primary, intra-run win. Also mark each persona's system prompt as cacheable on its single call, for the smaller cross-invocation win.
 3. Confirm this only applies to the `anthropic` provider — the `ollama` path has no caching support, so behavior for `ollama` must stay a no-op, not an error.
 4. Capture and log token usage (`generateText`'s returned `usage`) per call so the caching effect is visible and verifiable, not just assumed.
-5. Verify `npm run typecheck`, `npm run build`, and `npm test` pass, and do a before/after token-usage comparison on a real `review` run to confirm cache hits are occurring.
+5. Verify `npm run typecheck`, `npm run build`, and `npm test` pass. Confirm the AST/diff caching by comparing input-token cost between the first and later calls within one `review` run, and confirm the persona caching by running `slipstream review` twice in a row and comparing the second run's cost to the first's.
 6. Push the branch and open a PR per the standard workflow.
