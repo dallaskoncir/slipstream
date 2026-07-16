@@ -56,3 +56,33 @@ Please create a new branch for Phase 5 and execute the following steps:
 4. **Verify and Wrap Up:**
    - Ensure all markdown files are properly formatted and easy to read.
    - Generate a final PR summary for this documentation branch and pause for my review before merging.
+
+## Phase 6: Architecture Diagram — Mermaid
+
+The ASCII-art data-flow diagram in `docs/ARCHITECTURE.md` is hand-drawn and fragile to keep aligned as the pipeline evolves. Replace it with a Mermaid diagram, which GitHub renders natively in markdown with no extra tooling.
+
+1. Create a new branch for Phase 6.
+2. Replace the ASCII diagram in `docs/ARCHITECTURE.md` with a ` ```mermaid ` flowchart representing the same Planner pipeline: AST extraction → context assembly (diff + secret scrub) → code-reviewer → security-auditor → test-generation → isolated-vm sandbox → aggregated report → delivery (stdout / file / PR comment).
+3. Preview the rendered markdown to confirm the diagram renders correctly on GitHub before opening the PR.
+4. Push the branch and open a PR per the standard workflow.
+
+## Phase 7: Parallelize Sandbox Test Generation
+
+`generateSandboxTest` in `src/services/ai-orchestrator.ts` only depends on the AST context + diff — not on the code-review or security-audit findings — but currently runs after both passes complete, sequentially. Running it concurrently with the code-review/security-audit chain removes one round-trip from the pipeline's wall-clock latency at no cost.
+
+1. Create a new branch for Phase 7.
+2. In `runReviewPipeline`, kick off `generateSandboxTest` in parallel with the code-review/security-audit chain (e.g. via `Promise.all`) instead of sequencing it after them.
+3. Update or add tests confirming the pipeline still returns the same `ReviewResult` shape and that all three model calls complete correctly when run concurrently.
+4. Verify `npm run typecheck`, `npm run build`, and `npm test` pass, and manually time a `slipstream review` run before/after to confirm the latency improvement.
+5. Push the branch and open a PR per the standard workflow.
+
+## Phase 8: Prompt Caching for Token Efficiency
+
+The AST context + diff (up to 40K chars) and the persona system prompts are currently resent in full on every one of the three model calls in a single `review` run. Use Anthropic prompt caching (`@ai-sdk/anthropic`'s `providerOptions.anthropic.cacheControl`) so the shared system prompt and AST/diff content are cached, and later calls in the same run read from cache instead of paying full input price.
+
+1. Create a new branch for Phase 8.
+2. In `src/services/ai-orchestrator.ts`, mark the persona system prompt and the AST-context/diff portion of the user prompt as cacheable (`cacheControl: { type: "ephemeral" }`) via `providerOptions.anthropic`.
+3. Confirm this only applies to the `anthropic` provider — the `ollama` path has no caching support, so behavior for `ollama` must stay a no-op, not an error.
+4. Capture and log token usage (`generateText`'s returned `usage`) per call so the caching effect is visible and verifiable, not just assumed.
+5. Verify `npm run typecheck`, `npm run build`, and `npm test` pass, and do a before/after token-usage comparison on a real `review` run to confirm cache hits are occurring.
+6. Push the branch and open a PR per the standard workflow.
