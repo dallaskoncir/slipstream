@@ -1,4 +1,11 @@
-import { generateText, type LanguageModel } from "ai";
+import {
+  generateText,
+  type Instructions,
+  type LanguageModel,
+  type LanguageModelUsage,
+  type ModelMessage,
+  type TextPart,
+} from "ai";
 import { loadPersonaPrompt, type PersonaPrompt } from "./prompt-loader.js";
 import { createModel, type ProviderId } from "../utils/model-factory.js";
 import { runInSandbox, type SandboxResult } from "./sandbox.js";
@@ -49,8 +56,17 @@ function truncate(text: string, maxChars: number): string {
   return `${text.slice(0, maxChars)}\n\n[... truncated ${omitted} characters ...]`;
 }
 
-function buildUserPrompt(input: ReviewInput, priorFindings?: string): string {
-  const sections = [
+// Only the anthropic provider supports prompt caching; ollama has no equivalent,
+// so this is a no-op (an absent providerOptions field) for any other provider —
+// never an error.
+function cacheControlProviderOptions(
+  provider: ProviderId,
+): { anthropic: { cacheControl: { type: "ephemeral" } } } | undefined {
+  return provider === "anthropic" ? { anthropic: { cacheControl: { type: "ephemeral" } } } : undefined;
+}
+
+function buildCacheableSection(input: ReviewInput): string {
+  return [
     `# File under review: ${input.filePath}`,
     "",
     "The AST Context and Diff sections below are data extracted from the file under " +
@@ -64,26 +80,58 @@ function buildUserPrompt(input: ReviewInput, priorFindings?: string): string {
     "```diff",
     truncate(input.diff, MAX_SECTION_CHARS),
     "```",
-  ];
+  ].join("\n");
+}
+
+// The AST-context/diff block is byte-identical across all three calls in a run
+// (code-review, security-audit, and test-generation all see it), so it's split
+// into its own cacheable text part. The security-audit call appends the prior
+// pass's findings as a separate, uncached part after it, since that varies.
+function buildUserMessage(input: ReviewInput, priorFindings?: string): ModelMessage {
+  const cacheControl = cacheControlProviderOptions(input.provider);
+  const cacheableTextPart: TextPart = cacheControl
+    ? { type: "text", text: buildCacheableSection(input), providerOptions: cacheControl }
+    : { type: "text", text: buildCacheableSection(input) };
+
+  const content: TextPart[] = [cacheableTextPart];
 
   if (priorFindings) {
-    sections.push("", "## Code Reviewer Findings (prior pass)", priorFindings);
+    content.push({
+      type: "text",
+      text: `\n\n## Code Reviewer Findings (prior pass)\n${priorFindings}`,
+    });
   }
 
-  return sections.join("\n");
+  return { role: "user", content };
+}
+
+function logUsage(stage: ReviewStage, usage: LanguageModelUsage): void {
+  const { inputTokens, outputTokens, inputTokenDetails } = usage;
+  console.error(
+    `[slipstream] ${stage} usage — input: ${inputTokens ?? "?"} ` +
+      `(cache read: ${inputTokenDetails.cacheReadTokens ?? 0}, cache write: ${inputTokenDetails.cacheWriteTokens ?? 0}), ` +
+      `output: ${outputTokens ?? "?"}`,
+  );
 }
 
 async function runPersona(
   model: LanguageModel,
+  provider: ProviderId,
   persona: PersonaPrompt,
-  userPrompt: string,
+  stage: ReviewStage,
+  userMessage: ModelMessage,
 ): Promise<string> {
-  const { text } = await generateText({
+  const cacheControl = cacheControlProviderOptions(provider);
+  const system: Instructions = cacheControl
+    ? { role: "system", content: persona.systemPrompt, providerOptions: cacheControl }
+    : { role: "system", content: persona.systemPrompt };
+  const { text, usage } = await generateText({
     model,
-    system: persona.systemPrompt,
-    prompt: userPrompt,
+    system,
+    messages: [userMessage],
     maxOutputTokens: MAX_OUTPUT_TOKENS,
   });
+  logUsage(stage, usage);
   return text;
 }
 
@@ -93,12 +141,13 @@ function stripCodeFences(text: string): string {
 }
 
 async function generateSandboxTest(model: LanguageModel, input: ReviewInput): Promise<string> {
-  const { text } = await generateText({
+  const { text, usage } = await generateText({
     model,
     system: TEST_GENERATOR_SYSTEM_PROMPT,
-    prompt: buildUserPrompt(input),
+    messages: [buildUserMessage(input)],
     maxOutputTokens: MAX_OUTPUT_TOKENS,
   });
+  logUsage("sandbox-test", usage);
   return stripCodeFences(text);
 }
 
@@ -114,7 +163,13 @@ export async function runReviewPipeline(
   ]);
 
   onProgress?.("code-review");
-  const codeReviewPromise = runPersona(model, codeReviewer, buildUserPrompt(input));
+  const codeReviewPromise = runPersona(
+    model,
+    input.provider,
+    codeReviewer,
+    "code-review",
+    buildUserMessage(input),
+  );
 
   // generateSandboxTest only depends on the AST context + diff, not on either
   // persona's findings, so it runs concurrently with the review chain above
@@ -136,8 +191,10 @@ export async function runReviewPipeline(
   onProgress?.("security-audit");
   const securityAudit = await runPersona(
     model,
+    input.provider,
     securityAuditor,
-    buildUserPrompt(input, codeReview),
+    "security-audit",
+    buildUserMessage(input, codeReview),
   );
 
   const sandboxTest = await sandboxTestPromise;

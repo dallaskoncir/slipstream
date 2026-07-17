@@ -6,15 +6,31 @@ type Kind = "code-reviewer" | "security-auditor" | "test-generator";
 interface RecordedCall {
   kind: Kind;
   startedAt: number;
+  hasSystemCacheControl: boolean;
+  hasUserCacheControl: boolean;
 }
+
+interface GenerateTextOpts {
+  system: string | { content: string; providerOptions?: unknown };
+  messages: Array<{ content: Array<{ providerOptions?: unknown }> }>;
+}
+
+const FIXED_USAGE = {
+  inputTokens: 100,
+  inputTokenDetails: { noCacheTokens: 10, cacheReadTokens: 80, cacheWriteTokens: 10 },
+  outputTokens: 50,
+  outputTokenDetails: { textTokens: 50, reasoningTokens: 0 },
+  totalTokens: 150,
+};
 
 let calls: RecordedCall[] = [];
 let delaysMs: Partial<Record<Kind, number>> = {};
 let errorsAfterMs: Partial<Record<Kind, number>> = {};
 
-function classify(system: string): Kind {
-  if (system === "CODE_REVIEWER_SYSTEM") return "code-reviewer";
-  if (system === "SECURITY_AUDITOR_SYSTEM") return "security-auditor";
+function classify(system: GenerateTextOpts["system"]): Kind {
+  const text = typeof system === "string" ? system : system.content;
+  if (text === "CODE_REVIEWER_SYSTEM") return "code-reviewer";
+  if (text === "SECURITY_AUDITOR_SYSTEM") return "security-auditor";
   return "test-generator";
 }
 
@@ -24,9 +40,14 @@ function classify(system: string): Kind {
 // `errorsAfterMs` state instead of re-mocking per test.
 mock.module("ai", {
   namedExports: {
-    generateText: async (opts: { system: string }) => {
+    generateText: async (opts: GenerateTextOpts) => {
       const kind = classify(opts.system);
-      calls.push({ kind, startedAt: Date.now() });
+      calls.push({
+        kind,
+        startedAt: Date.now(),
+        hasSystemCacheControl: typeof opts.system !== "string" && opts.system.providerOptions !== undefined,
+        hasUserCacheControl: opts.messages[0]?.content[0]?.providerOptions !== undefined,
+      });
       const delay = delaysMs[kind] ?? errorsAfterMs[kind] ?? 0;
       if (delay > 0) {
         await new Promise((resolve) => setTimeout(resolve, delay));
@@ -34,7 +55,7 @@ mock.module("ai", {
       if (errorsAfterMs[kind] !== undefined) {
         throw new Error(`${kind} failed`);
       }
-      return { text: `${kind}-output` };
+      return { text: `${kind}-output`, usage: FIXED_USAGE };
     },
   },
 });
@@ -129,4 +150,34 @@ test("a code-review failure doesn't leave the concurrent sandbox-test promise as
   // unhandled rejection, node's test runner attributes it to this still-running
   // test instead of it silently surfacing after the test (or the process) ends.
   await new Promise((resolve) => setTimeout(resolve, 80));
+});
+
+test("marks the persona system prompt and the AST/diff user content as cacheable for the anthropic provider", async () => {
+  calls = [];
+  delaysMs = {};
+  errorsAfterMs = {};
+
+  await runReviewPipeline(baseInput);
+
+  // code-reviewer and security-auditor both use a persona system prompt, so both
+  // get system-level cache control; test-generator's system prompt is a hardcoded
+  // string (not a persona), so it never does. All three share the same AST/diff
+  // user content, so all three get user-level cache control.
+  const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
+  assert.equal(byKind["code-reviewer"]?.hasSystemCacheControl, true);
+  assert.equal(byKind["security-auditor"]?.hasSystemCacheControl, true);
+  assert.equal(byKind["test-generator"]?.hasSystemCacheControl, false);
+  assert.equal(byKind["code-reviewer"]?.hasUserCacheControl, true);
+  assert.equal(byKind["security-auditor"]?.hasUserCacheControl, true);
+  assert.equal(byKind["test-generator"]?.hasUserCacheControl, true);
+});
+
+test("omits cache-control metadata entirely for the ollama provider instead of erroring", async () => {
+  calls = [];
+  delaysMs = {};
+  errorsAfterMs = {};
+
+  await runReviewPipeline({ ...baseInput, provider: "ollama" });
+
+  assert.ok(calls.every((c) => !c.hasSystemCacheControl && !c.hasUserCacheControl));
 });
