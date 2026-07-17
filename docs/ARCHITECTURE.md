@@ -48,6 +48,8 @@ This is the "Planner": it runs the two personas as sequential passes, not in par
 
 All three passes go through `src/utils/model-factory.ts`, which is what makes the provider swappable — `createModel("anthropic")` and `createModel("ollama")` both return the same `LanguageModel` type from the Vercel AI SDK, so the orchestration code above never branches on which provider is active. The orchestrator also accepts an optional progress callback, fired at each stage boundary, which is how the CLI drives its step-by-step terminal UI without the orchestration logic knowing anything about `@clack/prompts`.
 
+**Prompt caching (Anthropic only).** The AST-context/diff block is byte-identical across all three calls, so on the `anthropic` provider it's marked cacheable (`providerOptions.anthropic.cacheControl`), along with each persona's system prompt — the intra-run win is the code-review and test-generation calls no longer resend the same 40K-char block the code-review call already sent, and the security-audit call reads it back from cache instead of resending it a third time. This trades a data-retention change for that saving: cached content is held server-side by Anthropic for the cache TTL (a few minutes, ephemeral) instead of being processed per-request and discarded, so the file's AST/diff — already redacted by `secret-scrubber.ts`, but still your source code — persists there briefly. `ollama` never sets `cacheControl`, so this doesn't apply when running fully air-gapped.
+
 ## 4. Sandboxed verification (`src/services/sandbox.ts`)
 
 The generated test isn't just printed — it's actually executed, inside an ephemeral `isolated-vm` isolate:
