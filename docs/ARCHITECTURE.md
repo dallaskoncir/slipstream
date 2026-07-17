@@ -8,7 +8,8 @@ Slipstream doesn't ask one model "is this file okay?" and print the answer. It r
 
 ```mermaid
 flowchart TD
-    A["Target file<br/>(ts-morph AST parser)"] --> C["Context assembly<br/>(diff + secret scrub)"]
+    A["Target file"] --> A2["ts-morph AST parser"]
+    A2 --> C["Context assembly<br/>(diff + secret scrub)"]
     B["git diff"] --> C
     C --> D["code-reviewer<br/>(LLM pass 1)"]
     D --> E["security-auditor<br/>(LLM pass 2)"]
