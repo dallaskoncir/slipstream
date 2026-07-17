@@ -79,6 +79,16 @@ SCRUTINEER_MODEL_OLLAMA=llama3.1:8b
 
 `GITHUB_TOKEN` is only needed if you want `scrutineer review` to post its report as a PR comment (see below) — a personal access token with permission to comment on the repo's PRs is enough.
 
+## Troubleshooting
+
+**pnpm (v10+):** Scrutineer uses `isolated-vm` for secure, sandboxed execution of AI-generated scripts, and `isolated-vm` requires a native C++ build step. Modern versions of pnpm block native build scripts by default for security reasons, so after `pnpm install` you'll need to run:
+
+```bash
+pnpm approve-builds
+```
+
+and allow `isolated-vm` to compile.
+
 ## Usage
 
 Run the full review pipeline (code review → security audit, with a sandboxed smoke test generated and executed in parallel) against a file. With no flags, it prints a step-by-step progress UI and the final report to your terminal:
