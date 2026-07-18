@@ -6,6 +6,12 @@ function modelId(model: Awaited<ReturnType<typeof createModel>>): string {
   return (model as { modelId: string }).modelId;
 }
 
+function configuredUrl(model: Awaited<ReturnType<typeof createModel>>, path: string): string {
+  const config = (model as unknown as { config: { url: (opts: { path: string }) => string } })
+    .config;
+  return config.url({ path });
+}
+
 function withMockFetch(t: import("node:test").TestContext, impl: typeof fetch) {
   const original = global.fetch;
   global.fetch = impl;
@@ -62,6 +68,18 @@ test("createModel(ollama) respects SCRUTINEER_MODEL_OLLAMA without querying Olla
 
   const model = await createModel("ollama");
   assert.equal(modelId(model), "phi4");
+});
+
+test("createModel(ollama) still targets OLLAMA_HOST when SCRUTINEER_MODEL_OLLAMA skips detection", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", "phi4");
+  withEnv(t, "OLLAMA_HOST", "http://172.27.96.1:11434");
+  withMockFetch(t, (async () => {
+    throw new Error("fetch should not be called when an override is set");
+  }) as typeof fetch);
+
+  const model = await createModel("ollama");
+  assert.equal(modelId(model), "phi4");
+  assert.equal(configuredUrl(model, "/chat"), "http://172.27.96.1:11434/api/chat");
 });
 
 test("createModel(ollama) uses the currently running model from /api/ps", async (t) => {
@@ -148,6 +166,21 @@ test("createModel(ollama) warns on stderr when OLLAMA_HOST redirects review cont
     messages.some((m) => m.includes("172.27.96.1:11434") && m.includes("OLLAMA_HOST")),
     `expected a warning mentioning OLLAMA_HOST and the redirected host, got: ${JSON.stringify(messages)}`,
   );
+});
+
+test("createModel(ollama) does not warn for semantically-local OLLAMA_HOST values (localhost, ::1)", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
+  const messages = withMockConsoleError(t);
+  withMockFetch(t, (async () => {
+    return { ok: true, json: async () => ({ models: [] }) } as Response;
+  }) as typeof fetch);
+
+  withEnv(t, "OLLAMA_HOST", "localhost:11434");
+  await createModel("ollama");
+  withEnv(t, "OLLAMA_HOST", "http://[::1]:11434");
+  await createModel("ollama");
+
+  assert.equal(messages.length, 0);
 });
 
 test("createModel(ollama) does not warn when OLLAMA_HOST is unset (local default)", async (t) => {

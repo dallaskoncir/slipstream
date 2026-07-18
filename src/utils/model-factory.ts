@@ -19,6 +19,15 @@ const MODEL_ENV_VAR: Record<ProviderId, string> = {
 };
 
 const DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434";
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    return LOOPBACK_HOSTNAMES.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
 
 // Respects OLLAMA_HOST the same way the official `ollama` CLI does, so scrutineer
 // talks to whatever server the user already pointed their tooling at (e.g. a Windows
@@ -84,7 +93,7 @@ export async function createModel(provider: ProviderId): Promise<LanguageModel> 
       return anthropic(override ?? DEFAULT_MODEL_ID.anthropic);
     case "ollama": {
       const baseUrl = resolveOllamaBaseUrl();
-      if (baseUrl !== DEFAULT_OLLAMA_HOST) {
+      if (!isLoopbackUrl(baseUrl)) {
         console.error(
           `scrutineer: OLLAMA_HOST is set — sending review content (code diffs, AST context) to ${baseUrl} instead of the local default. Make sure you trust this endpoint.`,
         );
