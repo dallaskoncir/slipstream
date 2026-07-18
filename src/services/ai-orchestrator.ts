@@ -161,7 +161,7 @@ export async function runReviewPipeline(
   onProgress?: ReviewProgressCallback,
 ): Promise<ReviewResult> {
   onProgress?.("loading-personas");
-  const model = createModel(input.provider);
+  const model = await createModel(input.provider);
   const [codeReviewer, securityAuditor] = await Promise.all([
     loadPersonaPrompt("code-reviewer"),
     loadPersonaPrompt("security-auditor"),
