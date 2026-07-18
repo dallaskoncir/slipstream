@@ -38,9 +38,13 @@ interface OllamaModelSummary {
   name?: string;
 }
 
+const OLLAMA_DETECTION_TIMEOUT_MS = 2_000;
+
 async function fetchOllamaModels(path: string): Promise<OllamaModelSummary[]> {
   try {
-    const response = await fetch(`${resolveOllamaBaseUrl()}${path}`);
+    const response = await fetch(`${resolveOllamaBaseUrl()}${path}`, {
+      signal: AbortSignal.timeout(OLLAMA_DETECTION_TIMEOUT_MS),
+    });
     if (!response.ok) {
       return [];
     }
@@ -79,7 +83,13 @@ export async function createModel(provider: ProviderId): Promise<LanguageModel> 
     case "anthropic":
       return anthropic(override ?? DEFAULT_MODEL_ID.anthropic);
     case "ollama": {
-      const ollama = createOllama({ baseURL: `${resolveOllamaBaseUrl()}/api` });
+      const baseUrl = resolveOllamaBaseUrl();
+      if (baseUrl !== DEFAULT_OLLAMA_HOST) {
+        console.error(
+          `scrutineer: OLLAMA_HOST is set — sending review content (code diffs, AST context) to ${baseUrl} instead of the local default. Make sure you trust this endpoint.`,
+        );
+      }
+      const ollama = createOllama({ baseURL: `${baseUrl}/api` });
       return ollama(override ?? (await detectOllamaModelId()));
     }
   }

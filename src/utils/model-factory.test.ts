@@ -14,6 +14,18 @@ function withMockFetch(t: import("node:test").TestContext, impl: typeof fetch) {
   });
 }
 
+function withMockConsoleError(t: import("node:test").TestContext): string[] {
+  const messages: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = original;
+  });
+  return messages;
+}
+
 function withEnv(t: import("node:test").TestContext, key: string, value: string | undefined) {
   const original = process.env[key];
   if (value === undefined) {
@@ -121,4 +133,31 @@ test("createModel(ollama) normalizes a bare host:port OLLAMA_HOST (no scheme, tr
 
   await createModel("ollama");
   assert.equal(requestedUrls[0], "http://172.27.96.1:11434/api/ps");
+});
+
+test("createModel(ollama) warns on stderr when OLLAMA_HOST redirects review content off the local default", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
+  withEnv(t, "OLLAMA_HOST", "http://172.27.96.1:11434");
+  const messages = withMockConsoleError(t);
+  withMockFetch(t, (async () => {
+    return { ok: true, json: async () => ({ models: [] }) } as Response;
+  }) as typeof fetch);
+
+  await createModel("ollama");
+  assert.ok(
+    messages.some((m) => m.includes("172.27.96.1:11434") && m.includes("OLLAMA_HOST")),
+    `expected a warning mentioning OLLAMA_HOST and the redirected host, got: ${JSON.stringify(messages)}`,
+  );
+});
+
+test("createModel(ollama) does not warn when OLLAMA_HOST is unset (local default)", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
+  withEnv(t, "OLLAMA_HOST", undefined);
+  const messages = withMockConsoleError(t);
+  withMockFetch(t, (async () => {
+    return { ok: true, json: async () => ({ models: [] }) } as Response;
+  }) as typeof fetch);
+
+  await createModel("ollama");
+  assert.equal(messages.length, 0);
 });
