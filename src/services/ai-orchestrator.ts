@@ -59,7 +59,12 @@ export interface ReviewResult {
 // string before this runs, which makes hitting MAX_SECTION_CHARS far more likely
 // than with a single file — so this is logged the same way secret redaction is
 // (see withSecretsScrubbed in git-diff.ts), instead of only leaving a marker
-// embedded in the prompt itself where the user never sees it.
+// embedded in the prompt itself where the user never sees it. `filePath` is
+// whatever label the caller passed as ReviewInput.filePath — in a --diff batch
+// that's the batch description ("N file(s) changed vs <target>"), not a single
+// filename, since truncation happens on the already-concatenated string and this
+// function has no visibility into where one file's content ends and the next
+// begins.
 function truncate(text: string, maxChars: number, section: string, filePath: string): string {
   if (text.length <= maxChars) {
     return text;
@@ -100,14 +105,21 @@ function buildCacheableSection(input: ReviewInput): string {
 }
 
 // The AST-context/diff block is byte-identical across all three calls in a run
-// (code-review, security-audit, and test-generation all see it), so it's split
-// into its own cacheable text part. The security-audit call appends the prior
-// pass's findings as a separate, uncached part after it, since that varies.
-function buildUserMessage(input: ReviewInput, priorFindings?: string): ModelMessage {
-  const cacheControl = cacheControlProviderOptions(input.provider);
+// (code-review, security-audit, and test-generation all see it), so the caller
+// builds it once via buildCacheableSection() and passes the resulting string in
+// here — both to let the AI SDK actually hit its prompt cache on repeated content,
+// and so truncate() (called inside buildCacheableSection) only logs a truncation
+// warning once per run instead of once per call. The security-audit call appends
+// the prior pass's findings as a separate, uncached part after it, since that varies.
+function buildUserMessage(
+  cacheableSection: string,
+  provider: ProviderId,
+  priorFindings?: string,
+): ModelMessage {
+  const cacheControl = cacheControlProviderOptions(provider);
   const cacheableTextPart: TextPart = cacheControl
-    ? { type: "text", text: buildCacheableSection(input), providerOptions: cacheControl }
-    : { type: "text", text: buildCacheableSection(input) };
+    ? { type: "text", text: cacheableSection, providerOptions: cacheControl }
+    : { type: "text", text: cacheableSection };
 
   const content: TextPart[] = [cacheableTextPart];
 
@@ -189,7 +201,8 @@ function stripCodeFences(text: string): string {
 
 async function generateSandboxTest(
   model: LanguageModel,
-  input: ReviewInput,
+  cacheableSection: string,
+  provider: ProviderId,
   abortSignal: AbortSignal,
 ): Promise<string> {
   let text: string;
@@ -198,13 +211,13 @@ async function generateSandboxTest(
     ({ text, usage } = await generateText({
       model,
       system: TEST_GENERATOR_SYSTEM_PROMPT,
-      messages: [buildUserMessage(input)],
+      messages: [buildUserMessage(cacheableSection, provider)],
       maxOutputTokens: MAX_OUTPUT_TOKENS,
       abortSignal,
       timeout: REQUEST_TIMEOUT_MS,
     }));
   } catch (error) {
-    throw friendlyModelError(error, input.provider, model);
+    throw friendlyModelError(error, provider, model);
   }
   logUsage("sandbox-test", usage);
   return stripCodeFences(text);
@@ -221,6 +234,11 @@ export async function runReviewPipeline(
     loadPersonaPrompt("security-auditor"),
   ]);
 
+  // Built once per run and reused across all three calls below — see the comment
+  // on buildUserMessage() for why (prompt-cache reuse, and a single truncation
+  // warning instead of one per call).
+  const cacheableSection = buildCacheableSection(input);
+
   // Shared across every call in this run: each call is independently bounded by
   // its own `timeout` (see REQUEST_TIMEOUT_MS), but this lets a failure in one
   // call cut the others short immediately too, instead of leaving them to run
@@ -233,7 +251,7 @@ export async function runReviewPipeline(
     input.provider,
     codeReviewer,
     "code-review",
-    buildUserMessage(input),
+    buildUserMessage(cacheableSection, input.provider),
     controller.signal,
   );
 
@@ -242,7 +260,7 @@ export async function runReviewPipeline(
   // instead of after it.
   onProgress?.("sandbox-test");
   const sandboxTestPromise = (async () => {
-    const code = await generateSandboxTest(model, input, controller.signal);
+    const code = await generateSandboxTest(model, cacheableSection, input.provider, controller.signal);
     const result = await runInSandbox(code);
     return { code, result };
   })();
@@ -273,7 +291,7 @@ export async function runReviewPipeline(
       input.provider,
       securityAuditor,
       "security-audit",
-      buildUserMessage(input, codeReview),
+      buildUserMessage(cacheableSection, input.provider, codeReview),
       controller.signal,
     );
   } catch (error) {

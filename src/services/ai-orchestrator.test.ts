@@ -317,8 +317,13 @@ test("warns on stderr when the AST context or diff is truncated, instead of sile
   // which is what makes crossing the 40K-char cap realistic in practice.
   await runReviewPipeline({ ...baseInput, astContext: "x".repeat(40_001) });
 
-  assert.ok(
-    messages.some((m) => m.includes("AST context") && m.includes("example.ts") && m.includes("truncated")),
-    `expected a truncation warning mentioning the AST context and file, got: ${JSON.stringify(messages)}`,
+  const truncationWarnings = messages.filter(
+    (m) => m.includes("AST context") && m.includes("example.ts") && m.includes("truncated"),
+  );
+  assert.equal(
+    truncationWarnings.length,
+    1,
+    `expected exactly one truncation warning (the AST/diff block is built once per run and reused ` +
+      `across all three model calls), got: ${JSON.stringify(messages)}`,
   );
 });
