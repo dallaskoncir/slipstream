@@ -75,7 +75,7 @@ program
   .option("--repo <owner/repo>", "GitHub repo slug for --pr (defaults to the origin remote)")
   .option(
     "--diff <target>",
-    "review every changed .ts/.tsx file against this git ref (e.g. origin/main) as a single batch, instead of one file",
+    "review every changed .ts/.tsx file (plus package.json, next.config.*, and *.sql files) against this git ref (e.g. origin/main) as a single batch, instead of one file",
   )
   .addHelpText(
     "after",
@@ -148,7 +148,7 @@ program
           return;
         }
         if (files.length === 0) {
-          clack.outro(`No changed .ts/.tsx files found vs ${options.diff}`);
+          clack.outro(`No changed files worth reviewing found vs ${options.diff}`);
           return;
         }
 

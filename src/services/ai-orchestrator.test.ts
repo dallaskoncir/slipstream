@@ -8,6 +8,7 @@ interface RecordedCall {
   kind: Kind;
   startedAt: number;
   systemText: string;
+  systemPartCacheControl: boolean[];
   userText: string;
   hasSystemCacheControl: boolean;
   hasUserCacheControl: boolean;
@@ -15,11 +16,25 @@ interface RecordedCall {
   timeoutMs: number | undefined;
 }
 
+interface SystemPart {
+  content: string;
+  providerOptions?: unknown;
+}
+
 interface GenerateTextOpts {
-  system: string | { content: string; providerOptions?: unknown };
+  system: string | SystemPart | SystemPart[];
   messages: Array<{ content: Array<{ text: string; providerOptions?: unknown }> }>;
   abortSignal?: AbortSignal;
   timeout?: number;
+}
+
+// The persona's base prompt and the dynamic skill additions (skill-router.ts)
+// are sent as separate system parts (an array) so the base prompt keeps its
+// own cache breakpoint — see the comment on basePart in runPersona(). Tests
+// below work with the combined text/cache-control state across every part.
+function systemParts(system: GenerateTextOpts["system"]): SystemPart[] {
+  if (typeof system === "string") return [{ content: system }];
+  return Array.isArray(system) ? system : [system];
 }
 
 const FIXED_USAGE = {
@@ -52,12 +67,9 @@ function resetState(): void {
 }
 
 function classify(system: GenerateTextOpts["system"]): Kind {
-  const text = typeof system === "string" ? system : system.content;
-  // Dynamic skill routing (skill-router.ts) appends extra text after the base
-  // persona prompt when the diff matches a triggered category, so this can no
-  // longer be an exact match — only a prefix check survives that.
-  if (text.startsWith("CODE_REVIEWER_SYSTEM")) return "code-reviewer";
-  if (text.startsWith("SECURITY_AUDITOR_SYSTEM")) return "security-auditor";
+  const text = systemParts(system)[0]?.content ?? "";
+  if (text === "CODE_REVIEWER_SYSTEM") return "code-reviewer";
+  if (text === "SECURITY_AUDITOR_SYSTEM") return "security-auditor";
   return "test-generator";
 }
 
@@ -75,12 +87,14 @@ mock.module("ai", {
     APICallError,
     generateText: async (opts: GenerateTextOpts) => {
       const kind = classify(opts.system);
+      const parts = systemParts(opts.system);
       calls.push({
         kind,
         startedAt: Date.now(),
-        systemText: typeof opts.system === "string" ? opts.system : opts.system.content,
+        systemText: parts.map((part) => part.content).join("\n\n"),
+        systemPartCacheControl: parts.map((part) => part.providerOptions !== undefined),
         userText: opts.messages[0]?.content.map((part) => part.text).join("") ?? "",
-        hasSystemCacheControl: typeof opts.system !== "string" && opts.system.providerOptions !== undefined,
+        hasSystemCacheControl: parts.some((part) => part.providerOptions !== undefined),
         hasUserCacheControl: opts.messages[0]?.content[0]?.providerOptions !== undefined,
         hasAbortSignal: opts.abortSignal instanceof AbortSignal,
         timeoutMs: opts.timeout,
@@ -421,4 +435,26 @@ test("injects nothing when no changed file matches a dynamic skill category", as
   const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
   assert.doesNotMatch(byKind["code-reviewer"]!.systemText, /Dynamic Skill/);
   assert.doesNotMatch(byKind["security-auditor"]!.systemText, /Dynamic Skill/);
+});
+
+test("keeps the persona's base prompt as its own cache breakpoint, separate from the dynamic skill additions", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: ["src/app/page.tsx"] });
+
+  // The base persona prompt (part 0) is cache-controlled independently of
+  // whatever dynamic additions get appended; the additions themselves (part 1)
+  // vary per diff, so they're sent as plain, uncached text instead of paying a
+  // cache-write cost for content unlikely to be reused across runs.
+  const codeReviewer = calls.find((c) => c.kind === "code-reviewer")!;
+  assert.deepEqual(codeReviewer.systemPartCacheControl, [true, false]);
+});
+
+test("keeps the persona system prompt as a single cache-controlled part when no dynamic skill category is triggered", async () => {
+  resetState();
+
+  await runReviewPipeline(baseInput);
+
+  const codeReviewer = calls.find((c) => c.kind === "code-reviewer")!;
+  assert.deepEqual(codeReviewer.systemPartCacheControl, [true]);
 });

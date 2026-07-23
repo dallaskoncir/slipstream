@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { scrubSecrets } from "./secret-scrubber.js";
+import { isDynamicSkillTrigger } from "./skill-router.js";
 
 const CHANGED_FILE_EXTENSIONS = [".ts", ".tsx"];
 
@@ -51,7 +52,11 @@ export function getChangedFiles(target: string, cwd?: string): string[] {
   return output
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length > 0 && CHANGED_FILE_EXTENSIONS.some((ext) => line.endsWith(ext)));
+    .filter(
+      (line) =>
+        line.length > 0 &&
+        (CHANGED_FILE_EXTENSIONS.some((ext) => line.endsWith(ext)) || isDynamicSkillTrigger(line)),
+    );
 }
 
 export function getDiffAgainstTarget(target: string, filePaths: string[], cwd?: string): string {

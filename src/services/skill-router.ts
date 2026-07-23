@@ -1,11 +1,33 @@
 export type SkillCategory = "frontend" | "backend" | "config";
 
-const FRONTEND_PATTERNS = [/(^|\/)page\.tsx$/, /(^|\/)layout\.tsx$/, /(^|\/)components\//];
-const BACKEND_PATTERNS = [/(^|\/)route\.ts$/, /(^|\/)schema\.ts$/, /(^|\/)prisma\//, /\.sql$/];
-const CONFIG_PATTERNS = [/(^|\/)package\.json$/, /(^|\/)next\.config\.(ts|js|mjs)$/];
+// Case-insensitive (`i`) since real-world filenames vary in case (e.g. a
+// Windows checkout or a component named `Components/`) and none of these
+// patterns are case-sensitive by convention.
+const FRONTEND_PATTERNS = [/(^|\/)page\.tsx$/i, /(^|\/)layout\.tsx$/i, /(^|\/)components\//i];
+const BACKEND_PATTERNS = [/(^|\/)route\.ts$/i, /(^|\/)schema\.ts$/i, /(^|\/)prisma\//i, /\.sql$/i];
+const CONFIG_PATTERNS = [/(^|\/)package\.json$/i, /(^|\/)next\.config\.(ts|js|mjs)$/i];
 
+// `.sql` files aren't `.ts`/`.tsx`, so getChangedFiles() (git-diff.ts) drops them
+// before a --diff batch's changedFiles ever reaches this module — see
+// isDynamicSkillTrigger() below, which git-diff.ts uses to keep them (and the
+// CONFIG_PATTERNS filenames) in the batch instead of silently discarding them.
+const SQL_PATTERN = /\.sql$/i;
+
+// All patterns are anchored/linear with no nested quantifiers, so there's no
+// ReDoS risk from running them against attacker-influenced file paths.
 function matchesAny(patterns: RegExp[], filePath: string): boolean {
-  return patterns.some((pattern) => pattern.test(filePath));
+  const normalized = filePath.replace(/\\/g, "/");
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
+// Filenames the dynamic skill router cares about that fall outside the
+// .ts/.tsx extensions getChangedFiles() otherwise limits a --diff batch to.
+// Without this, `package.json`, `next.config.js`/`.mjs`, and `*.sql` files
+// never survive into changedFiles on the tool's primary --diff review path,
+// making the "config" category and the SQL half of "backend" unreachable
+// there (they'd only ever trigger via single-file review).
+export function isDynamicSkillTrigger(filePath: string): boolean {
+  return matchesAny(CONFIG_PATTERNS, filePath) || matchesAny([SQL_PATTERN], filePath);
 }
 
 const REACT_ARCHITECTURE_AND_PERFORMANCE = `## Dynamic Skill: React Architecture & Performance Auditor

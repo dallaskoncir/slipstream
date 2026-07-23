@@ -5,6 +5,7 @@ import {
   type LanguageModel,
   type LanguageModelUsage,
   type ModelMessage,
+  type SystemModelMessage,
   type TextPart,
 } from "ai";
 import { loadPersonaPrompt, type PersonaPrompt } from "./prompt-loader.js";
@@ -197,13 +198,18 @@ async function runPersona(
   userMessage: ModelMessage,
   abortSignal: AbortSignal,
 ): Promise<string> {
-  const systemPrompt = additionalInstructions
-    ? `${persona.systemPrompt}\n\n${additionalInstructions}`
-    : persona.systemPrompt;
   const cacheControl = cacheControlProviderOptions(provider);
-  const system: Instructions = cacheControl
-    ? { role: "system", content: systemPrompt, providerOptions: cacheControl }
-    : { role: "system", content: systemPrompt };
+  // The persona prompt is its own cache breakpoint, kept separate from the
+  // dynamic skill additions (see skill-router.ts) — those vary per diff, so
+  // folding them into the same string would tie the persona's cache hit rate
+  // to reviews repeatedly touching the same file-type categories, instead of
+  // any two reviews using the same persona regardless of what changed.
+  const basePart: SystemModelMessage = cacheControl
+    ? { role: "system", content: persona.systemPrompt, providerOptions: cacheControl }
+    : { role: "system", content: persona.systemPrompt };
+  const system: Instructions = additionalInstructions
+    ? [basePart, { role: "system", content: additionalInstructions }]
+    : basePart;
   let text: string;
   let usage: LanguageModelUsage;
   try {
