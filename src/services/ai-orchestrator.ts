@@ -1,6 +1,7 @@
 import {
   APICallError,
   generateText,
+  type FinishReason,
   type Instructions,
   type LanguageModel,
   type LanguageModelUsage,
@@ -19,7 +20,43 @@ import { buildDynamicSkillInstructions } from "./skill-router.js";
 // (issue #31) against the real, current value instead of a duplicated constant
 // that could silently drift out of sync.
 export const MAX_SECTION_CHARS = 40_000;
-const MAX_OUTPUT_TOKENS = 4096;
+// A review's natural length scales with how many files are in the --diff batch —
+// more files means more findings to describe, not a fixed amount of prose. A flat
+// cap sized for a single file was observed hitting its ceiling on a real 17-file
+// batch (the code-reviewer persona's response was cut off entirely, rendering an
+// empty report section — issue #33), while the same batch's security-audit and
+// sandbox-test calls used well under half of it. maxOutputTokens is a ceiling the
+// model can stop short of, not a floor it's obligated to fill (see the "stop"
+// finishReason case in warnIfOutputTruncated below), so scaling it up front costs
+// nothing when a review doesn't need the extra room — it only matters for the
+// batches that actually do.
+const BASE_OUTPUT_TOKENS = 4096;
+const PER_ADDITIONAL_FILE_OUTPUT_TOKENS = 256;
+// A hard ceiling regardless of batch size, so a pathological --diff (hundreds of
+// files) can't drive a single call's cost/latency arbitrarily high. A batch big
+// enough to still hit this still gets the visible truncation notice below rather
+// than failing silently; chunking a huge batch into multiple smaller review calls
+// would remove the ceiling entirely but is a larger architecture change tracked
+// separately (see issue #35), not folded into this scaling fix.
+const OUTPUT_TOKENS_CEILING = 16_384;
+
+// Exported so ai-orchestrator.test.ts can assert the scaling behavior against the
+// real, current formula instead of a duplicated one that could silently drift.
+export function resolveMaxOutputTokens(changedFileCount: number): number {
+  const additionalFiles = Math.max(0, changedFileCount - 1);
+  return Math.min(BASE_OUTPUT_TOKENS + additionalFiles * PER_ADDITIONAL_FILE_OUTPUT_TOKENS, OUTPUT_TOKENS_CEILING);
+}
+
+// Injected as its own system part (alongside, not inside, the persona prompt) so
+// it never touches prompt-loader.ts's hash-pinned persona content. Applies only to
+// the two review personas — prose findings are where output tokens tend to get
+// spent re-quoting the diff back rather than adding new information; test-
+// generation output is executable JS, where this guidance wouldn't make sense.
+const OUTPUT_EFFICIENCY_INSTRUCTIONS = `## Output Efficiency
+Your response has a bounded token budget. To make the most of it:
+- Use terse, information-dense bullet points rather than long prose paragraphs.
+- Reference code by file, line number, or symbol name instead of re-quoting large blocks of the diff or AST context back in your response.
+- Lead with the most significant findings; note minor or low-severity items briefly rather than at length.`;
 
 // Bounds every model call on its own, so a broken provider (bad key, unreachable
 // host, model not found) fails in bounded time instead of hanging indefinitely —
@@ -192,6 +229,35 @@ function logUsage(stage: ReviewStage, usage: LanguageModelUsage): void {
   );
 }
 
+// generateText has no equivalent to truncate()'s input-side handling: when a
+// response hits maxOutputTokens it just stops mid-generation and returns
+// whatever text it has so far (finishReason: "length") — including possibly
+// nothing at all, if the budget ran out before any text was emitted. Without
+// this check that fails completely silently: the caller (and, for personas, the
+// posted report) just sees a short or empty section that reads as "no
+// findings" rather than "the review didn't finish" (issue #33).
+function warnIfOutputTruncated(stage: ReviewStage, finishReason: FinishReason, maxOutputTokens: number): void {
+  if (finishReason === "length") {
+    console.error(
+      `scrutineer: ${stage} response hit the ${maxOutputTokens}-token output limit before finishing — ` +
+        "the output below may be incomplete.",
+    );
+  }
+}
+
+// Only meaningful for the two review personas, whose output is markdown text
+// that ends up directly in the posted report — generateSandboxTest's output is
+// executable JS, where appending prose would just corrupt the script, so it
+// relies on warnIfOutputTruncated()'s console.error alone.
+function appendTruncationNotice(text: string, finishReason: FinishReason): string {
+  if (finishReason !== "length") {
+    return text;
+  }
+  return text.trim().length > 0
+    ? `${text}\n\n_Note: this response was cut off after reaching the model's output token limit and may be incomplete._`
+    : "_Review truncated: the model's response exceeded the output token budget before completing._";
+}
+
 async function runPersona(
   model: LanguageModel,
   provider: ProviderId,
@@ -200,27 +266,40 @@ async function runPersona(
   stage: ReviewStage,
   userMessage: ModelMessage,
   abortSignal: AbortSignal,
+  maxOutputTokens: number,
 ): Promise<string> {
   const cacheControl = cacheControlProviderOptions(provider);
   // The persona prompt is its own cache breakpoint, kept separate from the
   // dynamic skill additions (see skill-router.ts) — those vary per diff, so
   // folding them into the same string would tie the persona's cache hit rate
   // to reviews repeatedly touching the same file-type categories, instead of
-  // any two reviews using the same persona regardless of what changed.
+  // any two reviews using the same persona regardless of what changed. The
+  // efficiency instructions, by contrast, are fixed scrutineer-authored text
+  // identical on every call, so they're folded directly into this same cached
+  // string rather than given their own breakpoint: at ~90 tokens on their own
+  // they'd sit under Anthropic's documented minimum cacheable segment size for
+  // Sonnet/Opus-class models (1024 tokens), leaving it ambiguous whether a
+  // trailing breakpoint that small actually gets cached. Riding along with the
+  // (much larger) persona prompt sidesteps that question entirely.
   const basePart: SystemModelMessage = cacheControl
-    ? { role: "system", content: persona.systemPrompt, providerOptions: cacheControl }
-    : { role: "system", content: persona.systemPrompt };
+    ? {
+        role: "system",
+        content: `${persona.systemPrompt}\n\n${OUTPUT_EFFICIENCY_INSTRUCTIONS}`,
+        providerOptions: cacheControl,
+      }
+    : { role: "system", content: `${persona.systemPrompt}\n\n${OUTPUT_EFFICIENCY_INSTRUCTIONS}` };
   const system: Instructions = additionalInstructions
     ? [basePart, { role: "system", content: additionalInstructions }]
     : basePart;
   let text: string;
   let usage: LanguageModelUsage;
+  let finishReason: FinishReason;
   try {
-    ({ text, usage } = await generateText({
+    ({ text, usage, finishReason } = await generateText({
       model,
       system,
       messages: [userMessage],
-      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      maxOutputTokens,
       abortSignal,
       timeout: REQUEST_TIMEOUT_MS,
     }));
@@ -228,7 +307,8 @@ async function runPersona(
     throw friendlyModelError(error, provider, model);
   }
   logUsage(stage, usage);
-  return text;
+  warnIfOutputTruncated(stage, finishReason, maxOutputTokens);
+  return appendTruncationNotice(text, finishReason);
 }
 
 function stripCodeFences(text: string): string {
@@ -241,15 +321,17 @@ async function generateSandboxTest(
   cacheableSection: string,
   provider: ProviderId,
   abortSignal: AbortSignal,
+  maxOutputTokens: number,
 ): Promise<string> {
   let text: string;
   let usage: LanguageModelUsage;
+  let finishReason: FinishReason;
   try {
-    ({ text, usage } = await generateText({
+    ({ text, usage, finishReason } = await generateText({
       model,
       system: TEST_GENERATOR_SYSTEM_PROMPT,
       messages: [buildUserMessage(cacheableSection, provider)],
-      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      maxOutputTokens,
       abortSignal,
       timeout: REQUEST_TIMEOUT_MS,
     }));
@@ -257,6 +339,7 @@ async function generateSandboxTest(
     throw friendlyModelError(error, provider, model);
   }
   logUsage("sandbox-test", usage);
+  warnIfOutputTruncated("sandbox-test", finishReason, maxOutputTokens);
   return stripCodeFences(text);
 }
 
@@ -282,6 +365,11 @@ export async function runReviewPipeline(
   // hallucinates concerns for file types that aren't present.
   const dynamicSkills = buildDynamicSkillInstructions(input.changedFiles);
 
+  // Computed once per run off the batch size (see resolveMaxOutputTokens) and
+  // shared by all three calls below — a --diff batch with more files needs more
+  // room to describe its findings, not a flat per-file-count-agnostic cap.
+  const maxOutputTokens = resolveMaxOutputTokens(input.changedFiles.length);
+
   // Shared across every call in this run: each call is independently bounded by
   // its own `timeout` (see REQUEST_TIMEOUT_MS), but this lets a failure in one
   // call cut the others short immediately too, instead of leaving them to run
@@ -290,7 +378,13 @@ export async function runReviewPipeline(
 
   function startSandboxTest(): Promise<SandboxTestOutcome> {
     const promise = (async () => {
-      const code = await generateSandboxTest(model, cacheableSection, input.provider, controller.signal);
+      const code = await generateSandboxTest(
+        model,
+        cacheableSection,
+        input.provider,
+        controller.signal,
+        maxOutputTokens,
+      );
       const result = await runInSandbox(code);
       return { code, result };
     })();
@@ -316,6 +410,7 @@ export async function runReviewPipeline(
     "code-review",
     buildUserMessage(cacheableSection, input.provider),
     controller.signal,
+    maxOutputTokens,
   );
 
   // generateSandboxTest only depends on the AST context + diff, not on either
@@ -350,6 +445,7 @@ export async function runReviewPipeline(
       "security-audit",
       buildUserMessage(cacheableSection, input.provider, codeReview),
       controller.signal,
+      maxOutputTokens,
     );
   } catch (error) {
     controller.abort(error);

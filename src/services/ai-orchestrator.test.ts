@@ -14,6 +14,7 @@ interface RecordedCall {
   hasUserCacheControl: boolean;
   hasAbortSignal: boolean;
   timeoutMs: number | undefined;
+  maxOutputTokens: number | undefined;
 }
 
 interface SystemPart {
@@ -26,6 +27,7 @@ interface GenerateTextOpts {
   messages: Array<{ content: Array<{ text: string; providerOptions?: unknown }> }>;
   abortSignal?: AbortSignal;
   timeout?: number;
+  maxOutputTokens?: number;
 }
 
 // The persona's base prompt and the dynamic skill additions (skill-router.ts)
@@ -48,6 +50,10 @@ const FIXED_USAGE = {
 let calls: RecordedCall[] = [];
 let delaysMs: Partial<Record<Kind, number>> = {};
 let errorsAfterMs: Partial<Record<Kind, number>> = {};
+// Simulates generateText hitting maxOutputTokens (issue #33). `text` lets a
+// test control whether the truncated response still has partial content or
+// came back fully empty, since the two need different handling downstream.
+let lengthTruncated: Partial<Record<Kind, { text: string }>> = {};
 // A call that never resolves on its own — only settles once its abortSignal
 // fires. Guarded by a long fallback timer so a regression in the abort wiring
 // makes the assertion fail instead of hanging the test suite forever.
@@ -64,12 +70,16 @@ function resetState(): void {
   hangUntilAborted = {};
   notFoundError = {};
   badRequestError = {};
+  lengthTruncated = {};
 }
 
 function classify(system: GenerateTextOpts["system"]): Kind {
   const text = systemParts(system)[0]?.content ?? "";
-  if (text === "CODE_REVIEWER_SYSTEM") return "code-reviewer";
-  if (text === "SECURITY_AUDITOR_SYSTEM") return "security-auditor";
+  // The base persona part now has the output-efficiency instructions folded into
+  // the same cached string (see the comment on basePart in runPersona()), so this
+  // is a prefix match rather than exact equality.
+  if (text.startsWith("CODE_REVIEWER_SYSTEM")) return "code-reviewer";
+  if (text.startsWith("SECURITY_AUDITOR_SYSTEM")) return "security-auditor";
   return "test-generator";
 }
 
@@ -98,6 +108,7 @@ mock.module("ai", {
         hasUserCacheControl: opts.messages[0]?.content[0]?.providerOptions !== undefined,
         hasAbortSignal: opts.abortSignal instanceof AbortSignal,
         timeoutMs: opts.timeout,
+        maxOutputTokens: opts.maxOutputTokens,
       });
 
       if (hangUntilAborted[kind]) {
@@ -135,7 +146,10 @@ mock.module("ai", {
       if (errorsAfterMs[kind] !== undefined) {
         throw new Error(`${kind} failed`);
       }
-      return { text: `${kind}-output`, usage: FIXED_USAGE };
+      if (lengthTruncated[kind]) {
+        return { text: lengthTruncated[kind]!.text, usage: FIXED_USAGE, finishReason: "length" };
+      }
+      return { text: `${kind}-output`, usage: FIXED_USAGE, finishReason: "stop" };
     },
   },
 });
@@ -163,7 +177,7 @@ mock.module("./sandbox.js", {
   },
 });
 
-const { runReviewPipeline } = await import("./ai-orchestrator.js");
+const { runReviewPipeline, resolveMaxOutputTokens } = await import("./ai-orchestrator.js");
 
 const baseInput = {
   filePath: "example.ts",
@@ -397,6 +411,69 @@ test("warns on stderr when the AST context or diff is truncated, instead of sile
   );
 });
 
+test("warns on stderr and appends a visible notice when a persona response hits the output token cap with partial text (GH #33)", async (t) => {
+  resetState();
+  const messages: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  lengthTruncated = { "code-reviewer": { text: "## Findings\nPartial review before the cap hit" } };
+
+  const result = await runReviewPipeline(baseInput);
+
+  assert.match(result.codeReview, /^## Findings\nPartial review before the cap hit/);
+  assert.match(result.codeReview, /cut off after reaching the model's output token limit/);
+  assert.ok(
+    messages.some((m) => m.includes("code-review") && m.includes("output limit")),
+    `expected an output-truncation warning, got: ${JSON.stringify(messages)}`,
+  );
+});
+
+test("returns a clear truncation marker instead of a blank section when a persona response hits the cap with no text at all (GH #33)", async () => {
+  resetState();
+  lengthTruncated = { "code-reviewer": { text: "" } };
+
+  const result = await runReviewPipeline(baseInput);
+
+  assert.match(result.codeReview, /Review truncated.*output token budget/);
+});
+
+test("does not treat a normal, complete response as truncated", async () => {
+  resetState();
+
+  const result = await runReviewPipeline(baseInput);
+
+  assert.equal(result.codeReview, "code-reviewer-output");
+  assert.equal(result.securityAudit, "security-auditor-output");
+});
+
+test("warns on stderr but does not corrupt the sandbox test script when test-generation itself hits the output cap (GH #33)", async (t) => {
+  resetState();
+  const messages: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  lengthTruncated = { "test-generator": { text: "console.log('PASS'" } };
+
+  const result = await runReviewPipeline(baseInput);
+
+  // stripCodeFences() output is untouched by the notice appended to persona
+  // text above — appending prose here would produce invalid JS for the sandbox.
+  assert.equal(result.sandboxTest.code, "console.log('PASS'");
+  assert.ok(
+    messages.some((m) => m.includes("sandbox-test") && m.includes("output limit")),
+    `expected an output-truncation warning, got: ${JSON.stringify(messages)}`,
+  );
+});
+
 test("injects React/Performance instructions into the code-reviewer prompt for frontend files, and nothing into security-auditor", async () => {
   resetState();
 
@@ -437,15 +514,17 @@ test("injects nothing when no changed file matches a dynamic skill category", as
   assert.doesNotMatch(byKind["security-auditor"]!.systemText, /Dynamic Skill/);
 });
 
-test("keeps the persona's base prompt as its own cache breakpoint, separate from the dynamic skill additions", async () => {
+test("keeps the persona's base prompt (now including the folded-in output-efficiency instructions) as its own cache breakpoint, separate from the dynamic skill additions", async () => {
   resetState();
 
   await runReviewPipeline({ ...baseInput, changedFiles: ["src/app/page.tsx"] });
 
-  // The base persona prompt (part 0) is cache-controlled independently of
-  // whatever dynamic additions get appended; the additions themselves (part 1)
-  // vary per diff, so they're sent as plain, uncached text instead of paying a
-  // cache-write cost for content unlikely to be reused across runs.
+  // The base persona prompt (part 0, now with OUTPUT_EFFICIENCY_INSTRUCTIONS
+  // folded into the same cached string — see the comment on basePart in
+  // runPersona()) is cache-controlled independently of whatever dynamic
+  // additions get appended (part 1, uncached — those vary per diff, so caching
+  // them would pay a cache-write cost for content unlikely to be reused across
+  // runs).
   const codeReviewer = calls.find((c) => c.kind === "code-reviewer")!;
   assert.deepEqual(codeReviewer.systemPartCacheControl, [true, false]);
 });
@@ -457,4 +536,65 @@ test("keeps the persona system prompt as a single cache-controlled part when no 
 
   const codeReviewer = calls.find((c) => c.kind === "code-reviewer")!;
   assert.deepEqual(codeReviewer.systemPartCacheControl, [true]);
+});
+
+test("appends output-efficiency instructions to both review personas, but not to test-generation (whose output is executable JS, not prose)", async () => {
+  resetState();
+
+  await runReviewPipeline(baseInput);
+
+  const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
+  assert.match(byKind["code-reviewer"]!.systemText, /Output Efficiency/);
+  assert.match(byKind["security-auditor"]!.systemText, /Output Efficiency/);
+  assert.doesNotMatch(byKind["test-generator"]!.systemText, /Output Efficiency/);
+});
+
+test("resolveMaxOutputTokens: base case, linear scaling, zero/negative-safe input, and the ceiling clamp", () => {
+  // Hardcoded literals rather than deriving "expected" from the function under
+  // test itself, so a regression in the constants (BASE_OUTPUT_TOKENS,
+  // PER_ADDITIONAL_FILE_OUTPUT_TOKENS, OUTPUT_TOKENS_CEILING) actually fails
+  // this test instead of just being self-consistent with a changed formula.
+  assert.equal(resolveMaxOutputTokens(0), 4096, "0 files (not reachable today, but shouldn't crash or go negative)");
+  assert.equal(resolveMaxOutputTokens(1), 4096, "single-file review keeps the pre-#33 default");
+  assert.equal(resolveMaxOutputTokens(2), 4352, "one additional file adds exactly one PER_ADDITIONAL_FILE increment");
+  assert.equal(resolveMaxOutputTokens(17), 8192, "the 17-file batch from issue #33's repro");
+  assert.equal(resolveMaxOutputTokens(49), 16384, "unclamped formula lands exactly on the ceiling at 49 files");
+  assert.equal(resolveMaxOutputTokens(50), 16384, "50 files would exceed the ceiling unclamped — proves Math.min is actually clamping, not coincidentally equal");
+  assert.equal(resolveMaxOutputTokens(500), 16384, "a pathological batch size stays clamped at the ceiling");
+});
+
+test("scales the output token cap with the number of changed files in the --diff batch, instead of a flat constant, and shares it across all three calls", async () => {
+  resetState();
+
+  await runReviewPipeline({
+    ...baseInput,
+    changedFiles: Array.from({ length: 17 }, (_, i) => `src/file${i}.ts`),
+  });
+
+  // 4096 (base) + 16 additional files * 256 = 8192 — the 17-file batch from
+  // issue #33 that silently produced an empty review under the old flat 4096 cap.
+  for (const call of calls) {
+    assert.equal(call.maxOutputTokens, 8192, `${call.kind} call should use the scaled cap`);
+  }
+});
+
+test("caps the scaled output token budget at a fixed 16384 ceiling instead of growing without bound for a pathological batch size", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: Array.from({ length: 500 }, (_, i) => `file${i}.ts`) });
+
+  assert.ok(calls.length > 0);
+  for (const call of calls) {
+    assert.equal(call.maxOutputTokens, 16384);
+  }
+});
+
+test("uses the base output token cap (4096) for a single-file review, matching the pre-#33 default", async () => {
+  resetState();
+
+  await runReviewPipeline(baseInput);
+
+  for (const call of calls) {
+    assert.equal(call.maxOutputTokens, 4096);
+  }
 });
