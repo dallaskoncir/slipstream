@@ -1,6 +1,7 @@
 import {
   APICallError,
   generateText,
+  type FinishReason,
   type Instructions,
   type LanguageModel,
   type LanguageModelUsage,
@@ -19,7 +20,15 @@ import { buildDynamicSkillInstructions } from "./skill-router.js";
 // (issue #31) against the real, current value instead of a duplicated constant
 // that could silently drift out of sync.
 export const MAX_SECTION_CHARS = 40_000;
-const MAX_OUTPUT_TOKENS = 4096;
+// 4096 was observed hitting its ceiling on a real 17-file --diff batch (the
+// code-reviewer persona's response was cut off entirely, rendering an empty
+// report section — issue #33). Doubled to give a multi-file batch, plus
+// whatever dynamic-skill instructions (skill-router.ts) it triggers, realistic
+// room to finish. Still bounded rather than unlimited/scaled-to-input, so a
+// single call can't blow up cost or hang on an unbounded response; the
+// finishReason check in runPersona()/generateSandboxTest() below now also
+// surfaces it visibly if a response still runs out of room at this cap.
+const MAX_OUTPUT_TOKENS = 8192;
 
 // Bounds every model call on its own, so a broken provider (bad key, unreachable
 // host, model not found) fails in bounded time instead of hanging indefinitely —
@@ -192,6 +201,35 @@ function logUsage(stage: ReviewStage, usage: LanguageModelUsage): void {
   );
 }
 
+// generateText has no equivalent to truncate()'s input-side handling: when a
+// response hits maxOutputTokens it just stops mid-generation and returns
+// whatever text it has so far (finishReason: "length") — including possibly
+// nothing at all, if the budget ran out before any text was emitted. Without
+// this check that fails completely silently: the caller (and, for personas, the
+// posted report) just sees a short or empty section that reads as "no
+// findings" rather than "the review didn't finish" (issue #33).
+function warnIfOutputTruncated(stage: ReviewStage, finishReason: FinishReason): void {
+  if (finishReason === "length") {
+    console.error(
+      `scrutineer: ${stage} response hit the ${MAX_OUTPUT_TOKENS}-token output limit before finishing — ` +
+        "the output below may be incomplete.",
+    );
+  }
+}
+
+// Only meaningful for the two review personas, whose output is markdown text
+// that ends up directly in the posted report — generateSandboxTest's output is
+// executable JS, where appending prose would just corrupt the script, so it
+// relies on warnIfOutputTruncated()'s console.error alone.
+function appendTruncationNotice(text: string, finishReason: FinishReason): string {
+  if (finishReason !== "length") {
+    return text;
+  }
+  return text.trim().length > 0
+    ? `${text}\n\n_Note: this response was cut off after reaching the model's output token limit and may be incomplete._`
+    : "_Review truncated: the model's response exceeded the output token budget before completing._";
+}
+
 async function runPersona(
   model: LanguageModel,
   provider: ProviderId,
@@ -215,8 +253,9 @@ async function runPersona(
     : basePart;
   let text: string;
   let usage: LanguageModelUsage;
+  let finishReason: FinishReason;
   try {
-    ({ text, usage } = await generateText({
+    ({ text, usage, finishReason } = await generateText({
       model,
       system,
       messages: [userMessage],
@@ -228,7 +267,8 @@ async function runPersona(
     throw friendlyModelError(error, provider, model);
   }
   logUsage(stage, usage);
-  return text;
+  warnIfOutputTruncated(stage, finishReason);
+  return appendTruncationNotice(text, finishReason);
 }
 
 function stripCodeFences(text: string): string {
@@ -244,8 +284,9 @@ async function generateSandboxTest(
 ): Promise<string> {
   let text: string;
   let usage: LanguageModelUsage;
+  let finishReason: FinishReason;
   try {
-    ({ text, usage } = await generateText({
+    ({ text, usage, finishReason } = await generateText({
       model,
       system: TEST_GENERATOR_SYSTEM_PROMPT,
       messages: [buildUserMessage(cacheableSection, provider)],
@@ -257,6 +298,7 @@ async function generateSandboxTest(
     throw friendlyModelError(error, provider, model);
   }
   logUsage("sandbox-test", usage);
+  warnIfOutputTruncated("sandbox-test", finishReason);
   return stripCodeFences(text);
 }
 

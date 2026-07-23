@@ -48,6 +48,10 @@ const FIXED_USAGE = {
 let calls: RecordedCall[] = [];
 let delaysMs: Partial<Record<Kind, number>> = {};
 let errorsAfterMs: Partial<Record<Kind, number>> = {};
+// Simulates generateText hitting maxOutputTokens (issue #33). `text` lets a
+// test control whether the truncated response still has partial content or
+// came back fully empty, since the two need different handling downstream.
+let lengthTruncated: Partial<Record<Kind, { text: string }>> = {};
 // A call that never resolves on its own — only settles once its abortSignal
 // fires. Guarded by a long fallback timer so a regression in the abort wiring
 // makes the assertion fail instead of hanging the test suite forever.
@@ -64,6 +68,7 @@ function resetState(): void {
   hangUntilAborted = {};
   notFoundError = {};
   badRequestError = {};
+  lengthTruncated = {};
 }
 
 function classify(system: GenerateTextOpts["system"]): Kind {
@@ -135,7 +140,10 @@ mock.module("ai", {
       if (errorsAfterMs[kind] !== undefined) {
         throw new Error(`${kind} failed`);
       }
-      return { text: `${kind}-output`, usage: FIXED_USAGE };
+      if (lengthTruncated[kind]) {
+        return { text: lengthTruncated[kind]!.text, usage: FIXED_USAGE, finishReason: "length" };
+      }
+      return { text: `${kind}-output`, usage: FIXED_USAGE, finishReason: "stop" };
     },
   },
 });
@@ -394,6 +402,69 @@ test("warns on stderr when the AST context or diff is truncated, instead of sile
     1,
     `expected exactly one truncation warning (the AST/diff block is built once per run and reused ` +
       `across all three model calls), got: ${JSON.stringify(messages)}`,
+  );
+});
+
+test("warns on stderr and appends a visible notice when a persona response hits the output token cap with partial text (GH #33)", async (t) => {
+  resetState();
+  const messages: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  lengthTruncated = { "code-reviewer": { text: "## Findings\nPartial review before the cap hit" } };
+
+  const result = await runReviewPipeline(baseInput);
+
+  assert.match(result.codeReview, /^## Findings\nPartial review before the cap hit/);
+  assert.match(result.codeReview, /cut off after reaching the model's output token limit/);
+  assert.ok(
+    messages.some((m) => m.includes("code-review") && m.includes("output limit")),
+    `expected an output-truncation warning, got: ${JSON.stringify(messages)}`,
+  );
+});
+
+test("returns a clear truncation marker instead of a blank section when a persona response hits the cap with no text at all (GH #33)", async () => {
+  resetState();
+  lengthTruncated = { "code-reviewer": { text: "" } };
+
+  const result = await runReviewPipeline(baseInput);
+
+  assert.match(result.codeReview, /Review truncated.*output token budget/);
+});
+
+test("does not treat a normal, complete response as truncated", async () => {
+  resetState();
+
+  const result = await runReviewPipeline(baseInput);
+
+  assert.equal(result.codeReview, "code-reviewer-output");
+  assert.equal(result.securityAudit, "security-auditor-output");
+});
+
+test("warns on stderr but does not corrupt the sandbox test script when test-generation itself hits the output cap (GH #33)", async (t) => {
+  resetState();
+  const messages: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  lengthTruncated = { "test-generator": { text: "console.log('PASS'" } };
+
+  const result = await runReviewPipeline(baseInput);
+
+  // stripCodeFences() output is untouched by the notice appended to persona
+  // text above — appending prose here would produce invalid JS for the sandbox.
+  assert.equal(result.sandboxTest.code, "console.log('PASS'");
+  assert.ok(
+    messages.some((m) => m.includes("sandbox-test") && m.includes("output limit")),
+    `expected an output-truncation warning, got: ${JSON.stringify(messages)}`,
   );
 });
 
