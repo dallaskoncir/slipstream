@@ -53,22 +53,33 @@ test("scrutineer review --help documents -m, --model", () => {
 function runReview(
   args: string[],
   options: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
-): { status: number | null; stdout: string; stderr: string; timedOut: boolean } {
+): { status: number | null; stdout: string; stderr: string; timedOut: boolean; elapsedMs: number } {
+  const startedAt = Date.now();
   try {
     const stdout = execFileSync(process.execPath, ["--import", "tsx", "src/index.ts", "review", ...args], {
       cwd: repoRoot,
       encoding: "utf-8",
       env: { ...process.env, ...options.env },
       timeout: options.timeoutMs,
+      // execFileSync's default kill signal (SIGTERM) can be intercepted: @clack/
+      // prompts' spinner registers its own SIGTERM handler to render a cancel
+      // frame, and doing so happens to also stop the very interval leak this
+      // suite guards against — so a genuinely hung process could still "exit"
+      // via that unrelated handler before the timeout ever proves anything.
+      // SIGKILL can't be caught, so a timeout here always means the child was
+      // actually still running when we gave up on it.
+      killSignal: options.timeoutMs !== undefined ? "SIGKILL" : undefined,
     });
-    return { status: 0, stdout, stderr: "", timedOut: false };
+    return { status: 0, stdout, stderr: "", timedOut: false, elapsedMs: Date.now() - startedAt };
   } catch (error) {
     const e = error as { status: number | null; stdout: string; stderr: string; signal?: string | null };
-    // execFileSync's `timeout` option kills the child (default signal SIGTERM) and
-    // throws instead of returning a normal exit code, so a timed-out run must be
-    // told apart from a real, prompt failure — otherwise a regression of the hang
-    // this test guards against would just look like "no assertions ran yet".
-    return { status: e.status, stdout: e.stdout, stderr: e.stderr, timedOut: e.signal === "SIGTERM" };
+    return {
+      status: e.status,
+      stdout: e.stdout,
+      stderr: e.stderr,
+      timedOut: e.signal === "SIGKILL",
+      elapsedMs: Date.now() - startedAt,
+    };
   }
 }
 
@@ -105,11 +116,19 @@ test("scrutineer review exits promptly instead of hanging when the review pipeli
   // rejects, which previously kept the process alive indefinitely after this
   // exact kind of failure. A bounded execFileSync timeout means a regression
   // fails this test instead of hanging the whole suite.
-  const { status, stdout, timedOut } = runReview(
+  const { status, stdout, timedOut, elapsedMs } = runReview(
     ["src/services/skill-router.ts", "--provider", "ollama"],
     { env: { OLLAMA_HOST: "http://127.0.0.1:1" }, timeoutMs: 30_000 },
   );
-  assert.equal(timedOut, false, "process should exit on its own instead of being killed by the test timeout");
+  assert.equal(timedOut, false, "process should exit on its own instead of being killed (SIGKILL) by the test timeout");
+  // Belt-and-suspenders beyond the signal check above: assert actual wall-clock
+  // time too, so this test can't be fooled by any other path — signal-based or
+  // not — that happens to leave `status`/`stdout` looking like a prompt success
+  // without the process actually having exited quickly on its own.
+  assert.ok(
+    elapsedMs < 15_000,
+    `expected the process to exit well under the 30s test timeout, took ${elapsedMs}ms`,
+  );
   assert.equal(status, 1);
   assert.match(stdout, /Review failed/);
 });
