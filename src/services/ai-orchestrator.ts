@@ -141,16 +141,28 @@ function buildUserMessage(
 // Ollama's own "model not found" response doesn't survive the AI SDK's generic
 // error handling as anything more than a bare "Not Found" (unlike the Anthropic
 // provider's actionable missing-key message), so rewrap it here with the model ID
-// and the exact command to fix it. Anything else — connection errors, timeouts,
-// real Anthropic errors — passes through unchanged.
+// and the exact command to fix it.
+//
+// Any other non-2xx APICallError (e.g. a bare "Bad Request") gets the status code
+// and raw response body appended, since the SDK's own error message otherwise
+// gives no way to tell what the provider actually rejected — see GH #22, where an
+// intermittent 400 against ollama was undiagnosable from "Bad Request" alone.
+// Non-APICallError failures (connection errors, timeouts) pass through unchanged.
 function friendlyModelError(error: unknown, provider: ProviderId, model: LanguageModel): unknown {
-  if (provider !== "ollama" || !APICallError.isInstance(error) || error.statusCode !== 404) {
+  if (!APICallError.isInstance(error)) {
     return error;
   }
-  const modelId = getModelId(model);
+  if (provider === "ollama" && error.statusCode === 404) {
+    const modelId = getModelId(model);
+    return new Error(
+      `Model "${modelId}" not found on the Ollama instance. Run \`ollama pull ${modelId}\` or set ` +
+        "SCRUTINEER_MODEL_OLLAMA to a model you've already pulled.",
+      { cause: error },
+    );
+  }
   return new Error(
-    `Model "${modelId}" not found on the Ollama instance. Run \`ollama pull ${modelId}\` or set ` +
-      "SCRUTINEER_MODEL_OLLAMA to a model you've already pulled.",
+    `${error.message} (status ${error.statusCode ?? "unknown"})` +
+      (error.responseBody ? `: ${error.responseBody}` : ""),
     { cause: error },
   );
 }
@@ -245,6 +257,25 @@ export async function runReviewPipeline(
   // out their own timeout unobserved after this function has already returned.
   const controller = new AbortController();
 
+  function startSandboxTest(): Promise<SandboxTestOutcome> {
+    const promise = (async () => {
+      const code = await generateSandboxTest(model, cacheableSection, input.provider, controller.signal);
+      const result = await runInSandbox(code);
+      return { code, result };
+    })();
+    // Prevent an unhandled-rejection crash: if codeReviewPromise or the
+    // security-audit call below rejects first, this function exits without
+    // ever reaching the `await sandboxTestPromise` line, leaving a later
+    // rejection here with no handler attached. Still surfaced via console.error
+    // so a genuine sandbox-test bug isn't indistinguishable from a cancellation.
+    promise.catch((error) => {
+      console.error(
+        `[scrutineer] sandbox-test failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+    return promise;
+  }
+
   onProgress?.("code-review");
   const codeReviewPromise = runPersona(
     model,
@@ -256,24 +287,17 @@ export async function runReviewPipeline(
   );
 
   // generateSandboxTest only depends on the AST context + diff, not on either
-  // persona's findings, so it runs concurrently with the review chain above
-  // instead of after it.
-  onProgress?.("sandbox-test");
-  const sandboxTestPromise = (async () => {
-    const code = await generateSandboxTest(model, cacheableSection, input.provider, controller.signal);
-    const result = await runInSandbox(code);
-    return { code, result };
-  })();
-  // Prevent an unhandled-rejection crash: if codeReviewPromise or the
-  // security-audit call below rejects first, this function exits without
-  // ever reaching the `await sandboxTestPromise` line, leaving a later
-  // rejection here with no handler attached. Still surfaced via console.error
-  // so a genuine sandbox-test bug isn't indistinguishable from a cancellation.
-  sandboxTestPromise.catch((error) => {
-    console.error(
-      `[scrutineer] sandbox-test failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  });
+  // persona's findings, so for anthropic (independent per-call API requests) it
+  // runs concurrently with the review chain above instead of after it. Ollama
+  // instead serves one local model process; a concurrent generateText call against
+  // that same model contends with the review chain's calls and was observed to
+  // intermittently return a bare 400 (GH #22), so ollama keeps the pre-Phase-7
+  // sequential order (started further below, once the chain has resolved).
+  let sandboxTestPromise: Promise<SandboxTestOutcome> | undefined;
+  if (input.provider !== "ollama") {
+    onProgress?.("sandbox-test");
+    sandboxTestPromise = startSandboxTest();
+  }
 
   let codeReview: string;
   try {
@@ -297,6 +321,11 @@ export async function runReviewPipeline(
   } catch (error) {
     controller.abort(error);
     throw error;
+  }
+
+  if (!sandboxTestPromise) {
+    onProgress?.("sandbox-test");
+    sandboxTestPromise = startSandboxTest();
   }
 
   const sandboxTest = await sandboxTestPromise;

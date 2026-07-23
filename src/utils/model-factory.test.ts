@@ -85,10 +85,16 @@ test("createModel(ollama) still targets OLLAMA_HOST when SCRUTINEER_MODEL_OLLAMA
 test("createModel(ollama) uses the currently running model from /api/ps", async (t) => {
   withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
   withMockFetch(t, (async (url: string) => {
-    assert.match(url, /\/api\/ps$/);
+    // Real /api/ps entries never carry `capabilities` (see isChatCapable's
+    // comment) — this is deliberately absent here, matching the real contract,
+    // with /api/tags supplying it for the cross-reference.
+    if (url.endsWith("/api/ps")) {
+      return { ok: true, json: async () => ({ models: [{ model: "phi4:14b" }] }) } as Response;
+    }
+    assert.match(url, /\/api\/tags$/);
     return {
       ok: true,
-      json: async () => ({ models: [{ model: "phi4:14b" }] }),
+      json: async () => ({ models: [{ model: "phi4:14b", capabilities: ["completion"] }] }),
     } as Response;
   }) as typeof fetch);
 
@@ -111,6 +117,69 @@ test("createModel(ollama) falls back to /api/tags when nothing is running", asyn
 
   const model = await createModel("ollama");
   assert.equal(modelId(model), "llama3.1:8b");
+});
+
+test("createModel(ollama) skips an /api/ps model that /api/tags reports as embedding-only, in favor of a chat-capable one", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
+  withMockFetch(t, (async (url: string) => {
+    // /api/ps itself never reports capabilities (realistic shape) — both
+    // candidates look identical here. Only /api/tags's per-model capabilities
+    // distinguish the embedding model from the chat-capable one.
+    if (url.endsWith("/api/ps")) {
+      return {
+        ok: true,
+        json: async () => ({
+          models: [{ model: "nomic-embed-text:latest" }, { model: "phi4:latest" }],
+        }),
+      } as Response;
+    }
+    assert.match(url, /\/api\/tags$/);
+    return {
+      ok: true,
+      json: async () => ({
+        models: [
+          { model: "nomic-embed-text:latest", capabilities: ["embedding"] },
+          { model: "phi4:latest", capabilities: ["completion"] },
+        ],
+      }),
+    } as Response;
+  }) as typeof fetch);
+
+  const model = await createModel("ollama");
+  assert.equal(modelId(model), "phi4:latest");
+});
+
+test("createModel(ollama) falls back to the hardcoded default when the only running model is embedding-only per /api/tags", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
+  withMockFetch(t, (async (url: string) => {
+    if (url.endsWith("/api/ps")) {
+      return { ok: true, json: async () => ({ models: [{ model: "nomic-embed-text:latest" }] }) } as Response;
+    }
+    assert.match(url, /\/api\/tags$/);
+    return {
+      ok: true,
+      json: async () => ({ models: [{ model: "nomic-embed-text:latest", capabilities: ["embedding"] }] }),
+    } as Response;
+  }) as typeof fetch);
+
+  const model = await createModel("ollama");
+  assert.equal(modelId(model), "phi4");
+});
+
+test("createModel(ollama) treats a model with no capabilities reported anywhere as usable, for older Ollama versions", async (t) => {
+  withEnv(t, "SCRUTINEER_MODEL_OLLAMA", undefined);
+  withMockFetch(t, (async (url: string) => {
+    // Neither endpoint reports `capabilities` here, simulating an Ollama version
+    // that predates the field entirely.
+    if (url.endsWith("/api/ps")) {
+      return { ok: true, json: async () => ({ models: [{ model: "phi4:14b" }] }) } as Response;
+    }
+    assert.match(url, /\/api\/tags$/);
+    return { ok: true, json: async () => ({ models: [{ model: "phi4:14b" }] }) } as Response;
+  }) as typeof fetch);
+
+  const model = await createModel("ollama");
+  assert.equal(modelId(model), "phi4:14b");
 });
 
 test("createModel(ollama) falls back to the hardcoded default when Ollama is unreachable", async (t) => {

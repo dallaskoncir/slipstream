@@ -4,7 +4,7 @@ This document walks through what happens when you run `scrutineer review <file>`
 
 ## The shape of it: Planner, not a single call
 
-Scrutineer doesn't ask one model "is this file okay?" and print the answer. It runs a small planner loop: extract context once, pass it through two specialized personas in sequence (each one sees the prior one's output), and — concurrently with that chain, since it doesn't depend on either persona's findings — verify a claim about the code's behavior by actually running generated code in a sandbox. Once both branches finish, it delivers the aggregated result wherever you asked for it.
+Scrutineer doesn't ask one model "is this file okay?" and print the answer. It runs a small planner loop: extract context once, pass it through two specialized personas in sequence (each one sees the prior one's output), and verify a claim about the code's behavior by actually running generated code in a sandbox. On the `anthropic` provider, test generation runs concurrently with that persona chain, since it doesn't depend on either persona's findings; on `ollama` it runs sequentially after the chain instead, since a concurrent `generateText` call against the same local model was found to contend with the persona chain's calls and intermittently fail (see [issue #22](https://github.com/dallaskoncir/scrutineer/issues/22)). Once every branch finishes, it delivers the aggregated result wherever you asked for it.
 
 ```mermaid
 flowchart TD
@@ -13,7 +13,7 @@ flowchart TD
     B["git diff<br/>(working tree, or vs --diff target)"] --> C
     C --> D["code-reviewer<br/>(LLM pass 1)"]
     D --> E["security-auditor<br/>(LLM pass 2)"]
-    C --> F["test-generation<br/>(LLM pass, runs in parallel with D/E)"]
+    C --> F["test-generation<br/>(LLM pass, parallel with D/E on anthropic;<br/>sequential after E on ollama)"]
     F --> G["isolated-vm sandbox<br/>(air-gapped exec)"]
     E --> H["Aggregated Markdown report"]
     G --> H
@@ -43,13 +43,15 @@ The loader pins to a specific commit and verifies each fetched (or cached) file 
 
 ## 3. The orchestration loop (`src/services/ai-orchestrator.ts`)
 
-This is the "Planner": the two personas run as sequential passes, because the second pass is supposed to build on the first, but test generation runs as a separate concurrent branch since it only needs the AST context + diff, not either persona's output:
+This is the "Planner": the two personas run as sequential passes, because the second pass is supposed to build on the first, but test generation runs as a separate branch since it only needs the AST context + diff, not either persona's output — whether that branch runs concurrently with the persona chain or after it depends on the provider:
 
 1. **code-reviewer** sees the AST context + diff and produces general findings (correctness, readability, architecture, security, performance).
 2. **security-auditor** sees the *same* AST context + diff, plus the code-reviewer's findings, and does a security-focused deep dive — building on what the first pass already flagged instead of duplicating it.
-3. **test generation** — the same model is prompted with a different system prompt, in parallel with the code-reviewer/security-auditor chain above (kicked off right after the code-review call starts, not awaited after it), to write a small smoke test. Because the sandbox it's about to run in has no filesystem access, the model can't `import` the file under test — the prompt tells it to reimplement just the pure logic it needs inline, assert against it, and log `PASS` or `FAIL: <reason>`.
+3. **test generation** — the same model is prompted with a different system prompt to write a small smoke test. Because the sandbox it's about to run in has no filesystem access, the model can't `import` the file under test — the prompt tells it to reimplement just the pure logic it needs inline, assert against it, and log `PASS` or `FAIL: <reason>`.
 
-The CLI's progress messages reflect this: they fire in the order `code-review` → `sandbox-test` → `security-audit`, not the numbered order above — the sandbox-test stage starts as soon as the code-review call is kicked off, before security-audit even begins.
+On the **anthropic** provider, test generation is kicked off right after the code-review call starts, in parallel with the code-reviewer/security-auditor chain — each call is an independent request to Anthropic's API, so there's no shared-resource contention. The CLI's progress messages reflect this: they fire in the order `code-review` → `sandbox-test` → `security-audit`, not the numbered order above.
+
+On the **ollama** provider, test generation instead runs after `security-audit` completes. Ollama serves one local model process, and a concurrent `generateText` call against that same model while the persona chain is also mid-flight was found to intermittently return a bare 400 (`Bad Request`) — see [issue #22](https://github.com/dallaskoncir/scrutineer/issues/22). Progress messages fire in the numbered order above: `code-review` → `security-audit` → `sandbox-test`.
 
 All three passes go through `src/utils/model-factory.ts`, which is what makes the provider swappable — `createModel("anthropic")` and `createModel("ollama")` both return the same `LanguageModel` type from the Vercel AI SDK, so the orchestration code above never branches on which provider is active. The orchestrator also accepts an optional progress callback, fired at each stage boundary, which is how the CLI drives its step-by-step terminal UI without the orchestration logic knowing anything about `@clack/prompts`. See [ADR-001](decisions/0001-provider-agnostic-model-factory.md) for why this is a thin factory over the Vercel AI SDK rather than LangChain or a hand-rolled per-provider client.
 

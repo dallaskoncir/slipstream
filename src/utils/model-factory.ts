@@ -46,6 +46,7 @@ function resolveOllamaBaseUrl(): string {
 interface OllamaModelSummary {
   model?: string;
   name?: string;
+  capabilities?: string[];
 }
 
 const OLLAMA_DETECTION_TIMEOUT_MS = 2_000;
@@ -65,6 +66,24 @@ async function fetchOllamaModels(path: string): Promise<OllamaModelSummary[]> {
   }
 }
 
+// Ollama reports a `capabilities` array per model on /api/tags (and /api/show) —
+// chat-capable models include "completion", embedding-only models (e.g.
+// nomic-embed-text) don't. /api/ps (currently-running models) never reports this
+// field at all, on any Ollama version, so a capability check against an /api/ps
+// entry's own (always-absent) field would be a no-op — verified directly against
+// a running instance's /api/ps output, not assumed. detectOllamaModelId() below
+// cross-references /api/tags for capabilities instead. Picking an embedding model
+// sends it a chat request it can't serve, which comes back as a bare "Bad Request"
+// indistinguishable from any other failure until you inspect the response body —
+// see GH #22, reproduced live against an instance where an embedding model
+// happened to be the most recently loaded (i.e. /api/ps-listed) one. A model with
+// no capabilities info available anywhere (older Ollama, or one missing from the
+// /api/tags cross-reference) is treated as "unknown, assume usable" rather than
+// excluded.
+function isChatCapable(capabilities: string[] | undefined): boolean {
+  return capabilities === undefined || capabilities.includes("completion");
+}
+
 // No explicit SCRUTINEER_MODEL_OLLAMA override: use whatever model the user actually
 // has loaded (or, failing that, pulled) in their local Ollama instance instead of a
 // hardcoded default that may not exist on their machine. Prefers a currently-running
@@ -72,12 +91,24 @@ async function fetchOllamaModels(path: string): Promise<OllamaModelSummary[]> {
 // warm and avoids a cold-load delay on the first request.
 async function detectOllamaModelId(): Promise<string> {
   const running = await fetchOllamaModels("/api/ps");
-  const loaded = running[0]?.model ?? running[0]?.name;
-  if (loaded) {
-    return loaded;
+  let tags: OllamaModelSummary[] | undefined;
+
+  if (running.length > 0) {
+    // /api/ps entries never carry `capabilities` themselves (see comment on
+    // isChatCapable), so resolve it by name against /api/tags, which does.
+    tags = await fetchOllamaModels("/api/tags");
+    const capabilitiesByModel = new Map(tags.map((m) => [m.model ?? m.name, m.capabilities]));
+    const chatCapable = running.filter((m) => {
+      const key = m.model ?? m.name;
+      return isChatCapable(m.capabilities ?? (key ? capabilitiesByModel.get(key) : undefined));
+    });
+    const loaded = chatCapable[0]?.model ?? chatCapable[0]?.name;
+    if (loaded) {
+      return loaded;
+    }
   }
 
-  const pulled = await fetchOllamaModels("/api/tags");
+  const pulled = (tags ?? (await fetchOllamaModels("/api/tags"))).filter((m) => isChatCapable(m.capabilities));
   const available = pulled[0]?.model ?? pulled[0]?.name;
   if (available) {
     return available;

@@ -38,6 +38,8 @@ let errorsAfterMs: Partial<Record<Kind, number>> = {};
 let hangUntilAborted: Partial<Record<Kind, boolean>> = {};
 // Simulates Ollama's 404 "model not found" response.
 let notFoundError: Partial<Record<Kind, boolean>> = {};
+// Simulates an arbitrary non-2xx APICallError (e.g. the "Bad Request" from GH #22).
+let badRequestError: Partial<Record<Kind, { responseBody?: string }>> = {};
 
 function resetState(): void {
   calls = [];
@@ -45,6 +47,7 @@ function resetState(): void {
   errorsAfterMs = {};
   hangUntilAborted = {};
   notFoundError = {};
+  badRequestError = {};
 }
 
 function classify(system: GenerateTextOpts["system"]): Kind {
@@ -98,6 +101,16 @@ mock.module("ai", {
           url: "http://127.0.0.1:11434/api/chat",
           requestBodyValues: {},
           statusCode: 404,
+        });
+      }
+      if (badRequestError[kind]) {
+        const { responseBody } = badRequestError[kind]!;
+        throw new APICallError({
+          message: "Bad Request",
+          url: "http://127.0.0.1:11434/api/chat",
+          requestBodyValues: {},
+          statusCode: 400,
+          ...(responseBody !== undefined ? { responseBody } : {}),
         });
       }
       if (errorsAfterMs[kind] !== undefined) {
@@ -177,6 +190,25 @@ test("reports progress stages in the order the concurrent pipeline actually sche
   await runReviewPipeline(baseInput, (stage) => stages.push(stage));
 
   assert.deepEqual(stages, ["loading-personas", "code-review", "sandbox-test", "security-audit"]);
+});
+
+test("runs sandbox test generation after the review chain, not concurrently, for the ollama provider", async () => {
+  resetState();
+  // Slow down the code-review call. If sandbox-test were still started
+  // concurrently with it (as it is for anthropic), the test-generator call would
+  // begin before security-auditor. Ollama should instead only start it once
+  // security-auditor has resolved, to avoid contending with the review chain's
+  // calls against the same local model (see GH #22).
+  delaysMs = { "code-reviewer": 30 };
+  const stages: string[] = [];
+
+  await runReviewPipeline({ ...baseInput, provider: "ollama" }, (stage) => stages.push(stage));
+
+  assert.deepEqual(
+    calls.map((c) => c.kind),
+    ["code-reviewer", "security-auditor", "test-generator"],
+  );
+  assert.deepEqual(stages, ["loading-personas", "code-review", "security-audit", "sandbox-test"]);
 });
 
 test("frames the prior pass's findings as untrusted content, not instructions, in the security-audit prompt", async () => {
@@ -267,6 +299,23 @@ test("rewraps an Ollama 404 model-not-found error into an actionable message", a
     runReviewPipeline({ ...baseInput, provider: "ollama" }),
     /Model "mock-model" not found on the Ollama instance.*ollama pull mock-model.*SCRUTINEER_MODEL_OLLAMA/s,
   );
+});
+
+test("enriches a non-404 APICallError with its status code and response body, instead of a bare message", async () => {
+  resetState();
+  badRequestError = { "code-reviewer": { responseBody: '{"error":"invalid request shape"}' } };
+
+  await assert.rejects(
+    runReviewPipeline({ ...baseInput, provider: "ollama" }),
+    /Bad Request \(status 400\): \{"error":"invalid request shape"\}/,
+  );
+});
+
+test("enriches a non-404 APICallError without a response body using just the status code", async () => {
+  resetState();
+  badRequestError = { "code-reviewer": {} };
+
+  await assert.rejects(runReviewPipeline(baseInput), /Bad Request \(status 400\)$/);
 });
 
 test("leaves a non-404 error on the ollama provider unchanged, instead of misreporting it as model-not-found", async () => {
