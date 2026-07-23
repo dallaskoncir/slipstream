@@ -9,7 +9,7 @@ Scrutineer is an autonomous, sandboxed CLI that reviews the TypeScript files in 
 - **AST-grounded context, not just a raw diff.** `ts-morph` parses the target file and extracts exported function signatures, imports, and interfaces into a compact summary, so the model reviews structured facts about the file instead of guessing from text.
 - **Layered agent personas.** Each file goes through a `code-reviewer` pass and then a `security-auditor` pass, using pinned, hash-verified persona prompts sourced from Addy Osmani's `agent-skills` repository — see [`docs/decisions/0003-pin-and-hash-verify-persona-prompts.md`](docs/decisions/0003-pin-and-hash-verify-persona-prompts.md) for why they're pinned.
 - **Air-gapped local model support.** `--provider ollama` runs the entire pipeline against a local Ollama model, so nothing leaves your machine. Scrutineer warns on stderr if `OLLAMA_HOST` resolves off loopback, since that means review content is going somewhere other than your own box.
-- **`isolated-vm` secure sandbox.** The model also generates a small smoke test for the file, which runs inside an ephemeral V8 isolate with a bounded memory limit, an execution timeout, and zero filesystem, network, or Node built-in access. On `--provider anthropic` it runs in parallel with the review passes; on `--provider ollama` it runs after them instead, to avoid contending with a single local model. A script that blows past its budget gets its failure captured, not left to crash the process.
+- **`isolated-vm` secure sandbox.** The model also generates a small smoke test for the file, which runs inside an ephemeral V8 isolate with a bounded memory limit, an execution timeout, and zero filesystem, network, or Node built-in access. On `--provider anthropic`/`openai`/`gemini` it runs in parallel with the review passes; on `--provider ollama` it runs after them instead, to avoid contending with a single local model. A script that blows past its budget gets its failure captured, not left to crash the process.
 - **Diffs get scrubbed before they leave your machine.** Anything that looks like an API key, token, or private key block is redacted out of the diff before it's included in a prompt.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full data flow.
@@ -62,11 +62,15 @@ Scrutineer reads all credentials and overrides from environment variables in wha
 
 | Variable | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes, for `--provider anthropic` (the default) | API key used to call Claude. Not needed with `--provider ollama`. |
+| `ANTHROPIC_API_KEY` | Yes, for `--provider anthropic` (the default) | API key used to call Claude. Not needed with `--provider ollama`, `--provider openai`, or `--provider gemini`. |
+| `OPENAI_API_KEY` | Yes, for `--provider openai` | API key used to call OpenAI. |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Yes, for `--provider gemini` | API key used to call Gemini. |
 | `GITHUB_TOKEN` | Only for `scrutineer review --pr <number>` | Personal access token with permission to comment on the repo's PRs. |
 | `OLLAMA_HOST` | No | Overrides the Ollama server address (defaults to `http://127.0.0.1:11434`). Scrutineer warns on stderr if this isn't a loopback address, since review content is sent to whatever host it points at. |
 | `SCRUTINEER_MODEL_ANTHROPIC` | No | Overrides the default Anthropic model (`claude-sonnet-5`). |
 | `SCRUTINEER_MODEL_OLLAMA` | No | Overrides the default Ollama model (auto-detected from what's running locally, falling back to `phi4`). |
+| `SCRUTINEER_MODEL_OPENAI` | No | Overrides the default OpenAI model (`gpt-4o-mini`). |
+| `SCRUTINEER_MODEL_GEMINI` | No | Overrides the default Gemini model (`gemini-flash-lite-latest`). |
 
 **Local shell** — export vars directly, or drop them in a `.env` file (copy `.env.example` to `.env` and fill it in):
 
