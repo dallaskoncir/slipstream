@@ -5,7 +5,13 @@ export type SkillCategory = "frontend" | "backend" | "config";
 // patterns are case-sensitive by convention.
 const FRONTEND_PATTERNS = [/(^|\/)page\.tsx$/i, /(^|\/)layout\.tsx$/i, /(^|\/)components\//i];
 const BACKEND_PATTERNS = [/(^|\/)route\.ts$/i, /(^|\/)schema\.ts$/i, /(^|\/)prisma\//i, /\.sql$/i];
-const CONFIG_PATTERNS = [/(^|\/)package\.json$/i, /(^|\/)next\.config\.(ts|js|mjs)$/i];
+const CONFIG_PATTERNS = [
+  /(^|\/)package\.json$/i,
+  /(^|\/)next\.config\.(ts|js|mjs)$/i,
+  /(^|\/)pnpm-lock\.yaml$/i,
+  /(^|\/)package-lock\.json$/i,
+  /(^|\/)yarn\.lock$/i,
+];
 
 // `.sql` files aren't `.ts`/`.tsx`, so getChangedFiles() (git-diff.ts) drops them
 // before a --diff batch's changedFiles ever reaches this module — see
@@ -22,10 +28,13 @@ function matchesAny(patterns: RegExp[], filePath: string): boolean {
 
 // Filenames the dynamic skill router cares about that fall outside the
 // .ts/.tsx extensions getChangedFiles() otherwise limits a --diff batch to.
-// Without this, `package.json`, `next.config.js`/`.mjs`, and `*.sql` files
-// never survive into changedFiles on the tool's primary --diff review path,
-// making the "config" category and the SQL half of "backend" unreachable
-// there (they'd only ever trigger via single-file review).
+// Without this, `package.json`, `next.config.js`/`.mjs`, lockfiles, and
+// `*.sql` files never survive into changedFiles on the tool's primary --diff
+// review path, making the "config" category and the SQL half of "backend"
+// unreachable there (they'd only ever trigger via single-file review).
+// Lockfiles in particular matter here beyond skill routing: if a dependency
+// bump's lockfile update is invisible to the review, both personas tend to
+// flag a false-positive "no lockfile update" finding (issue #27).
 export function isDynamicSkillTrigger(filePath: string): boolean {
   return matchesAny(CONFIG_PATTERNS, filePath) || matchesAny([SQL_PATTERN], filePath);
 }
@@ -53,7 +62,8 @@ const DEPENDENCY_AND_ENV_AUDIT = `## Dynamic Skill: Dependency & Environment Aud
 This diff touches configuration files. In addition to your standard audit, specifically check for:
 - New or updated dependencies with known vulnerabilities or excessive install-time scripts
 - Environment variables introduced without validation, defaults, or documentation
-- Configuration changes that widen network/filesystem access or weaken security settings`;
+- Configuration changes that widen network/filesystem access or weaken security settings
+- A lockfile changed without a corresponding \`package.json\` change, or vice versa — one may be stale relative to the other`;
 
 export interface DynamicSkillInstructions {
   codeReviewerAdditions: string;
