@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import path from "node:path";
+import path, { join } from "node:path";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -131,4 +133,78 @@ test("scrutineer review exits promptly instead of hanging when the review pipeli
   );
   assert.equal(status, 1);
   assert.match(stdout, /Review failed/);
+});
+
+function git(cwd: string, args: string[]): void {
+  execFileSync("git", args, { cwd });
+}
+
+// A fixture repo whose "feature" branch adds `fileCount` new .ts files vs
+// "main" — enough to exercise chunkChangedFiles() splitting a --diff batch
+// into more than one chunk (MAX_FILES_PER_CHUNK is 10 as of this writing).
+function setupManyChangedFilesRepo(t: import("node:test").TestContext, fileCount: number): string {
+  const dir = mkdtempSync(join(tmpdir(), "scrutineer-index-chunking-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  git(dir, ["init", "-b", "main"]);
+  git(dir, ["config", "user.email", "test@example.com"]);
+  git(dir, ["config", "user.name", "Test"]);
+  writeFileSync(join(dir, "base.ts"), "export const base = 1;\n");
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-m", "base"]);
+
+  git(dir, ["checkout", "-b", "feature"]);
+  for (let i = 0; i < fileCount; i++) {
+    writeFileSync(join(dir, `file${i}.ts`), `export const value${i} = ${i};\n`);
+  }
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-m", "add many files"]);
+
+  return dir;
+}
+
+test("scrutineer review --diff splits a batch bigger than MAX_FILES_PER_CHUNK into multiple review chunks (GH #35)", (t) => {
+  const dir = setupManyChangedFilesRepo(t, 15); // > the 10-file default chunk size
+  const scriptPath = path.join(repoRoot, "src/index.ts");
+
+  let status: number | null;
+  let combinedOutput: string;
+  const startedAt = Date.now();
+  try {
+    const stdout = execFileSync(
+      process.execPath,
+      ["--import", "tsx", scriptPath, "review", "--diff", "main", "--provider", "ollama"],
+      {
+        // cwd stays repoRoot so tsx/node_modules resolve normally (matching
+        // every other test in this file) — GIT_DIR/GIT_WORK_TREE below point
+        // git itself at the fixture repo instead, without needing the CLI's
+        // own process.cwd() to change.
+        cwd: repoRoot,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          GIT_DIR: join(dir, ".git"),
+          GIT_WORK_TREE: dir,
+          // Unreachable host: same offline, fast-failing technique as the
+          // GH #28 test above — proves the chunking wiring is reached
+          // without paying for (or depending on) any real model call.
+          OLLAMA_HOST: "http://127.0.0.1:1",
+        },
+        timeout: 30_000,
+        killSignal: "SIGKILL",
+      },
+    );
+    status = 0;
+    combinedOutput = stdout;
+  } catch (error) {
+    const e = error as { status: number | null; stdout: string; stderr: string; signal?: string | null };
+    assert.notEqual(e.signal, "SIGKILL", "process should fail fast instead of hanging until the timeout");
+    status = e.status;
+    combinedOutput = e.stdout + e.stderr;
+  }
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(status, 1);
+  assert.ok(elapsedMs < 15_000, `expected a prompt offline failure, took ${elapsedMs}ms`);
+  assert.match(combinedOutput, /Batch split into 2 review chunks/);
 });

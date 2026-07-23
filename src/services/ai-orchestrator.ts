@@ -465,3 +465,249 @@ export async function runReviewPipeline(
     sandboxTest,
   };
 }
+
+// A single file group within a chunked --diff batch (see review-chunker.ts).
+// Each chunk gets its own AST context/diff — scoped to just that chunk's files,
+// not the whole batch — so it reviews like an independent, much smaller batch.
+export interface ReviewChunk {
+  // Used as this chunk's ReviewInput.filePath: both the "# File under review"
+  // heading in its prompt and the label truncate() names in an overflow
+  // warning, so a warning points at a specific chunk instead of the whole batch.
+  label: string;
+  changedFiles: string[];
+  astContext: string;
+  diff: string;
+}
+
+export interface ChunkedReviewInput {
+  filePath: string;
+  provider: ProviderId;
+  model: LanguageModel;
+  // The whole, unchunked batch's AST context/diff/file list — used ONLY for the
+  // single sandbox-test call below, which (per issue #33's own data) was never
+  // close to its output budget even at 17 files, so it stays a single call
+  // covering the whole batch rather than being chunked like the two personas.
+  fullAstContext: string;
+  fullDiff: string;
+  changedFiles: string[];
+  chunks: ReviewChunk[];
+}
+
+export interface ChunkedReviewProgressEvent {
+  stage: ReviewStage;
+  // 1-based; absent for "loading-personas" and the single "sandbox-test" event,
+  // both of which apply to the whole run rather than one chunk.
+  chunkIndex?: number;
+  chunkCount?: number;
+}
+
+export type ChunkedReviewProgressCallback = (event: ChunkedReviewProgressEvent) => void;
+
+// Bounds how many chunks' persona chains run at once for providers other than
+// ollama. Without this, Promise.all across every chunk in a huge batch (e.g. a
+// 200-file diff at 10 files/chunk is 20 chunks) would fire 20 simultaneous
+// code-review calls — a realistic way to trip provider rate limits regardless
+// of whether the batch size actually justifies that much concurrency. Exported
+// so ai-orchestrator.test.ts can assert concurrency actually stays bounded at
+// the real, current value instead of a duplicated one that could drift.
+export const MAX_CONCURRENT_CHUNKS = 3;
+
+// Runs `worker` over `items` with at most `concurrency` calls in flight at
+// once, preserving each result at its original index. A fixed-size pool of
+// "workers" each pull the next unprocessed index until none remain, rather
+// than batching in fixed-size groups, so a fast chunk doesn't sit idle waiting
+// for a slower sibling in the same batch before the pool picks up new work.
+async function mapWithConcurrencyLimit<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  async function runWorker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await worker(items[index] as T, index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runWorker));
+  return results;
+}
+
+// The chunked counterpart to runReviewPipeline, for --diff batches too large
+// for a single call's output-token ceiling to comfortably cover (issue #35,
+// the acknowledged follow-up to #33/#34's per-call scaling). Deliberately kept
+// separate from runReviewPipeline rather than unifying them: that function's
+// concurrency ordering is precisely regression-tested, and a single-chunk
+// "loop" isn't a clean 1-line parameterization of its two-call chain — so
+// runReviewPipeline stays untouched, and this covers only the >1-chunk case
+// (the caller keeps using runReviewPipeline directly whenever a batch fits in
+// one chunk, so typical/small --diff reviews see no behavior or cost change).
+export async function runChunkedReviewPipeline(
+  input: ChunkedReviewInput,
+  onProgress?: ChunkedReviewProgressCallback,
+): Promise<ReviewResult> {
+  onProgress?.({ stage: "loading-personas" });
+  const [codeReviewer, securityAuditor] = await Promise.all([
+    loadPersonaPrompt("code-reviewer"),
+    loadPersonaPrompt("security-auditor"),
+  ]);
+
+  // Shared across every call in this run (every chunk's persona pair, plus the
+  // single sandbox-test call) so a failure anywhere cuts everything else short
+  // immediately, matching runReviewPipeline's existing all-or-nothing semantics.
+  // Trade-off, accepted rather than solved here: the more chunks a batch has,
+  // the more already-completed chunk work a late failure discards. A future
+  // "retry only the failed chunk" is a reasonable separate follow-up.
+  const controller = new AbortController();
+
+  async function runChunkReviewPair(
+    chunk: ReviewChunk,
+    chunkIndex: number,
+  ): Promise<{ codeReview: string; securityAudit: string }> {
+    const chunkInput: ReviewInput = {
+      filePath: chunk.label,
+      astContext: chunk.astContext,
+      diff: chunk.diff,
+      provider: input.provider,
+      model: input.model,
+      changedFiles: chunk.changedFiles,
+    };
+    // Built once per chunk and reused for both calls below, exactly like
+    // runReviewPipeline's cacheableSection — one truncation warning per chunk
+    // (naming that chunk via its label) instead of one per call.
+    const cacheableSection = buildCacheableSection(chunkInput);
+    // Routed off this chunk's own files only, not the whole batch — a chunk
+    // with no frontend files shouldn't get React-persona instructions just
+    // because another chunk elsewhere in the batch has some.
+    const dynamicSkills = buildDynamicSkillInstructions(chunk.changedFiles);
+    // Sized to this chunk's own file count, not the whole batch's — a 10-file
+    // chunk gets a smaller, more accurate cap than the whole batch would need.
+    const maxOutputTokens = resolveMaxOutputTokens(chunk.changedFiles.length);
+    const chunkCount = input.chunks.length;
+
+    onProgress?.({ stage: "code-review", chunkIndex: chunkIndex + 1, chunkCount });
+    let codeReview: string;
+    try {
+      codeReview = await runPersona(
+        input.model,
+        input.provider,
+        codeReviewer,
+        dynamicSkills.codeReviewerAdditions,
+        "code-review",
+        buildUserMessage(cacheableSection, input.provider),
+        controller.signal,
+        maxOutputTokens,
+      );
+    } catch (error) {
+      controller.abort(error);
+      throw error;
+    }
+
+    onProgress?.({ stage: "security-audit", chunkIndex: chunkIndex + 1, chunkCount });
+    let securityAudit: string;
+    try {
+      securityAudit = await runPersona(
+        input.model,
+        input.provider,
+        securityAuditor,
+        dynamicSkills.securityAuditorAdditions,
+        "security-audit",
+        buildUserMessage(cacheableSection, input.provider, codeReview),
+        controller.signal,
+        maxOutputTokens,
+      );
+    } catch (error) {
+      controller.abort(error);
+      throw error;
+    }
+
+    return { codeReview, securityAudit };
+  }
+
+  // The whole, unchunked batch's content — used only for the single
+  // sandbox-test call, kept entirely separate from any chunk's own content.
+  const fullBatchInput: ReviewInput = {
+    filePath: input.filePath,
+    astContext: input.fullAstContext,
+    diff: input.fullDiff,
+    provider: input.provider,
+    model: input.model,
+    changedFiles: input.changedFiles,
+  };
+
+  function startSandboxTest(): Promise<SandboxTestOutcome> {
+    const cacheableSection = buildCacheableSection(fullBatchInput);
+    const maxOutputTokens = resolveMaxOutputTokens(input.changedFiles.length);
+    const promise = (async () => {
+      const code = await generateSandboxTest(
+        input.model,
+        cacheableSection,
+        input.provider,
+        controller.signal,
+        maxOutputTokens,
+      );
+      const result = await runInSandbox(code);
+      return { code, result };
+    })();
+    // Same floating-promise safeguard as runReviewPipeline's startSandboxTest:
+    // if a chunk fails first, this function exits without ever awaiting
+    // sandboxTestPromise, which would otherwise leave a later rejection here
+    // with no handler attached.
+    promise.catch((error) => {
+      console.error(
+        `[scrutineer] sandbox-test failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+    return promise;
+  }
+
+  // Same ollama-vs-other-providers split as runReviewPipeline: a concurrent
+  // generateText call against ollama's single local model process contends
+  // with the chunk calls and was observed to intermittently fail (GH #22).
+  let sandboxTestPromise: Promise<SandboxTestOutcome> | undefined;
+  if (input.provider !== "ollama") {
+    onProgress?.({ stage: "sandbox-test" });
+    sandboxTestPromise = startSandboxTest();
+  }
+
+  let chunkResults: Array<{ codeReview: string; securityAudit: string }>;
+  try {
+    if (input.provider === "ollama") {
+      chunkResults = [];
+      for (let i = 0; i < input.chunks.length; i++) {
+        chunkResults.push(await runChunkReviewPair(input.chunks[i] as ReviewChunk, i));
+      }
+    } else {
+      chunkResults = await mapWithConcurrencyLimit(input.chunks, MAX_CONCURRENT_CHUNKS, (chunk, index) =>
+        runChunkReviewPair(chunk, index),
+      );
+    }
+  } catch (error) {
+    controller.abort(error);
+    throw error;
+  }
+
+  if (!sandboxTestPromise) {
+    onProgress?.({ stage: "sandbox-test" });
+    sandboxTestPromise = startSandboxTest();
+  }
+
+  const sandboxTest = await sandboxTestPromise;
+
+  function aggregate(sectionOf: (result: { codeReview: string; securityAudit: string }) => string): string {
+    return chunkResults
+      .map((result, i) => {
+        const chunk = input.chunks[i] as ReviewChunk;
+        const heading = `### Chunk ${i + 1}/${input.chunks.length} (${chunk.changedFiles.length} file(s): ${chunk.changedFiles.join(", ")})`;
+        return `${heading}\n\n${sectionOf(result)}`;
+      })
+      .join("\n\n---\n\n");
+  }
+
+  return {
+    codeReview: aggregate((r) => r.codeReview),
+    securityAudit: aggregate((r) => r.securityAudit),
+    sandboxTest,
+  };
+}

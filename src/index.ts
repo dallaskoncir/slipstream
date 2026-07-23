@@ -5,10 +5,16 @@ import { Command, Option } from "commander";
 import * as clack from "@clack/prompts";
 import { parseFile, summaryToMarkdown } from "./services/ast-parser.js";
 import { getFileDiff, getChangedFiles, getDiffAgainstTarget } from "./services/git-diff.js";
-import { runReviewPipeline, type ReviewStage } from "./services/ai-orchestrator.js";
+import {
+  runReviewPipeline,
+  runChunkedReviewPipeline,
+  type ReviewChunk,
+  type ReviewStage,
+} from "./services/ai-orchestrator.js";
 import { buildReportMarkdown } from "./services/report.js";
 import { getRepoSlugFromGit, postPrComment } from "./services/github-client.js";
 import { createModel, getModelId, MODEL_ENV_VAR, PROVIDER_IDS, type ProviderId } from "./utils/model-factory.js";
+import { chunkChangedFiles, MAX_FILES_PER_CHUNK } from "./services/review-chunker.js";
 
 const program = new Command();
 
@@ -137,6 +143,7 @@ program
       let reportMarkdown = "";
       let label: string;
       let changedFiles: string[];
+      let reviewChunks: ReviewChunk[] = [];
 
       if (options.diff) {
         let files: string[];
@@ -156,11 +163,29 @@ program
         changedFiles = files;
         const diffTarget = options.diff;
 
+        // Large batches (issue #35) get split into multiple, smaller review
+        // calls instead of one call whose output/input a single batch could
+        // overflow — see review-chunker.ts. A batch that fits in one chunk
+        // (the common case) leaves fileChunks.length === 1 and the pipeline
+        // below runs exactly as it did before this feature existed.
+        const fileChunks = chunkChangedFiles(files);
+        if (fileChunks.length > 1) {
+          clack.log.info(
+            `Batch split into ${fileChunks.length} review chunks (~${MAX_FILES_PER_CHUNK} files each) — ` +
+              "findings will be aggregated into one report",
+          );
+        }
+
+        const astByFile = new Map<string, string>();
+
         await clack.tasks([
           {
             title: `Parse AST for ${files.length} file(s)`,
             task: () => {
-              astContext = files.map((f) => summaryToMarkdown(parseFile(f))).join("\n\n---\n\n");
+              for (const f of files) {
+                astByFile.set(f, summaryToMarkdown(parseFile(f)));
+              }
+              astContext = files.map((f) => astByFile.get(f)).join("\n\n---\n\n");
               return "AST extracted";
             },
           },
@@ -171,6 +196,22 @@ program
               return "Diff ready";
             },
           },
+          ...(fileChunks.length > 1
+            ? [
+                {
+                  title: `Prepare ${fileChunks.length} review chunk(s)`,
+                  task: () => {
+                    reviewChunks = fileChunks.map((chunkFiles, i) => ({
+                      label: `Chunk ${i + 1}/${fileChunks.length} (${chunkFiles.length} file(s)) vs ${diffTarget}`,
+                      changedFiles: chunkFiles,
+                      astContext: chunkFiles.map((f) => astByFile.get(f)).join("\n\n---\n\n"),
+                      diff: getDiffAgainstTarget(diffTarget, chunkFiles),
+                    }));
+                    return "Chunks ready";
+                  },
+                },
+              ]
+            : []),
         ]);
       } else {
         label = file as string;
@@ -198,10 +239,29 @@ program
         {
           title: `Run AI review pipeline (${options.provider} / ${getModelId(model)})`,
           task: async (message) => {
-            const result = await runReviewPipeline(
-              { filePath: label, astContext, diff, provider: options.provider, model, changedFiles },
-              (stage) => message(STAGE_MESSAGES[stage]),
-            );
+            const result =
+              reviewChunks.length > 1
+                ? await runChunkedReviewPipeline(
+                    {
+                      filePath: label,
+                      provider: options.provider,
+                      model,
+                      fullAstContext: astContext,
+                      fullDiff: diff,
+                      changedFiles,
+                      chunks: reviewChunks,
+                    },
+                    (event) =>
+                      message(
+                        event.chunkIndex !== undefined
+                          ? `Chunk ${event.chunkIndex}/${event.chunkCount}: ${STAGE_MESSAGES[event.stage]}`
+                          : STAGE_MESSAGES[event.stage],
+                      ),
+                  )
+                : await runReviewPipeline(
+                    { filePath: label, astContext, diff, provider: options.provider, model, changedFiles },
+                    (stage) => message(STAGE_MESSAGES[stage]),
+                  );
             reportMarkdown = buildReportMarkdown({
               filePath: label,
               provider: options.provider,

@@ -58,6 +58,12 @@ let lengthTruncated: Partial<Record<Kind, { text: string }>> = {};
 // fires. Guarded by a long fallback timer so a regression in the abort wiring
 // makes the assertion fail instead of hanging the test suite forever.
 let hangUntilAborted: Partial<Record<Kind, boolean>> = {};
+// Tracks how many code-reviewer/security-auditor calls are simultaneously
+// in flight (test-generator excluded — it's a single, separately-scheduled
+// call, not part of the chunk concurrency being measured), so chunked-pipeline
+// tests can assert real concurrency bounds instead of just call ordering.
+let activePersonaCalls = 0;
+let maxObservedPersonaConcurrency = 0;
 // Simulates Ollama's 404 "model not found" response.
 let notFoundError: Partial<Record<Kind, boolean>> = {};
 // Simulates an arbitrary non-2xx APICallError (e.g. the "Bad Request" from GH #22).
@@ -71,6 +77,8 @@ function resetState(): void {
   notFoundError = {};
   badRequestError = {};
   lengthTruncated = {};
+  activePersonaCalls = 0;
+  maxObservedPersonaConcurrency = 0;
 }
 
 function classify(system: GenerateTextOpts["system"]): Kind {
@@ -111,45 +119,56 @@ mock.module("ai", {
         maxOutputTokens: opts.maxOutputTokens,
       });
 
-      if (hangUntilAborted[kind]) {
-        await new Promise<void>((resolve, reject) => {
-          const fallback = setTimeout(resolve, 5000);
-          opts.abortSignal?.addEventListener("abort", () => {
-            clearTimeout(fallback);
-            reject(new Error(`${kind} aborted`));
+      const tracksConcurrency = kind !== "test-generator";
+      if (tracksConcurrency) {
+        activePersonaCalls++;
+        maxObservedPersonaConcurrency = Math.max(maxObservedPersonaConcurrency, activePersonaCalls);
+      }
+      try {
+        if (hangUntilAborted[kind]) {
+          await new Promise<void>((resolve, reject) => {
+            const fallback = setTimeout(resolve, 5000);
+            opts.abortSignal?.addEventListener("abort", () => {
+              clearTimeout(fallback);
+              reject(new Error(`${kind} aborted`));
+            });
           });
-        });
-      }
+        }
 
-      const delay = delaysMs[kind] ?? errorsAfterMs[kind] ?? 0;
-      if (delay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        const delay = delaysMs[kind] ?? errorsAfterMs[kind] ?? 0;
+        if (delay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+        if (notFoundError[kind]) {
+          throw new APICallError({
+            message: "Not Found",
+            url: "http://127.0.0.1:11434/api/chat",
+            requestBodyValues: {},
+            statusCode: 404,
+          });
+        }
+        if (badRequestError[kind]) {
+          const { responseBody } = badRequestError[kind]!;
+          throw new APICallError({
+            message: "Bad Request",
+            url: "http://127.0.0.1:11434/api/chat",
+            requestBodyValues: {},
+            statusCode: 400,
+            ...(responseBody !== undefined ? { responseBody } : {}),
+          });
+        }
+        if (errorsAfterMs[kind] !== undefined) {
+          throw new Error(`${kind} failed`);
+        }
+        if (lengthTruncated[kind]) {
+          return { text: lengthTruncated[kind]!.text, usage: FIXED_USAGE, finishReason: "length" };
+        }
+        return { text: `${kind}-output`, usage: FIXED_USAGE, finishReason: "stop" };
+      } finally {
+        if (tracksConcurrency) {
+          activePersonaCalls--;
+        }
       }
-      if (notFoundError[kind]) {
-        throw new APICallError({
-          message: "Not Found",
-          url: "http://127.0.0.1:11434/api/chat",
-          requestBodyValues: {},
-          statusCode: 404,
-        });
-      }
-      if (badRequestError[kind]) {
-        const { responseBody } = badRequestError[kind]!;
-        throw new APICallError({
-          message: "Bad Request",
-          url: "http://127.0.0.1:11434/api/chat",
-          requestBodyValues: {},
-          statusCode: 400,
-          ...(responseBody !== undefined ? { responseBody } : {}),
-        });
-      }
-      if (errorsAfterMs[kind] !== undefined) {
-        throw new Error(`${kind} failed`);
-      }
-      if (lengthTruncated[kind]) {
-        return { text: lengthTruncated[kind]!.text, usage: FIXED_USAGE, finishReason: "length" };
-      }
-      return { text: `${kind}-output`, usage: FIXED_USAGE, finishReason: "stop" };
     },
   },
 });
@@ -177,7 +196,8 @@ mock.module("./sandbox.js", {
   },
 });
 
-const { runReviewPipeline, resolveMaxOutputTokens } = await import("./ai-orchestrator.js");
+const { runReviewPipeline, resolveMaxOutputTokens, runChunkedReviewPipeline, MAX_CONCURRENT_CHUNKS } =
+  await import("./ai-orchestrator.js");
 
 const baseInput = {
   filePath: "example.ts",
@@ -597,4 +617,191 @@ test("uses the base output token cap (4096) for a single-file review, matching t
   for (const call of calls) {
     assert.equal(call.maxOutputTokens, 4096);
   }
+});
+
+// runChunkedReviewPipeline (issue #35) — --diff batches too large for a single
+// call's output-token ceiling, split into multiple smaller review calls and
+// aggregated back into one ReviewResult. Reuses the exact same "ai" mock as
+// runReviewPipeline's tests above; no new mocking infrastructure needed beyond
+// the activePersonaCalls/maxObservedPersonaConcurrency tracking added to it.
+
+const chunkedBaseInput = {
+  filePath: "23 file(s) changed vs origin/main",
+  provider: "anthropic" as const,
+  model: { modelId: "mock-model" } as unknown as import("ai").LanguageModel,
+  fullAstContext: "full-batch-ctx",
+  fullDiff: "full-batch-diff",
+  changedFiles: ["a.ts", "b.ts"],
+  chunks: [
+    { label: "Chunk 1/2 (1 file) vs origin/main", changedFiles: ["a.ts"], astContext: "CHUNK_A_CTX", diff: "CHUNK_A_DIFF" },
+    { label: "Chunk 2/2 (1 file) vs origin/main", changedFiles: ["b.ts"], astContext: "CHUNK_B_CTX", diff: "CHUNK_B_DIFF" },
+  ],
+};
+
+test("aggregates each chunk's codeReview/securityAudit under its own numbered heading, in order", async () => {
+  resetState();
+
+  const result = await runChunkedReviewPipeline(chunkedBaseInput);
+
+  const chunk1Heading = "### Chunk 1/2 (1 file(s): a.ts)";
+  const chunk2Heading = "### Chunk 2/2 (1 file(s): b.ts)";
+  for (const text of [result.codeReview, result.securityAudit]) {
+    assert.ok(text.includes(chunk1Heading), `expected "${chunk1Heading}" in: ${text}`);
+    assert.ok(text.includes(chunk2Heading), `expected "${chunk2Heading}" in: ${text}`);
+    assert.ok(text.indexOf(chunk1Heading) < text.indexOf(chunk2Heading), "chunk 1 should appear before chunk 2");
+  }
+});
+
+test("calls sandbox-test generation exactly once against the whole unchunked batch, regardless of chunk count", async () => {
+  resetState();
+
+  await runChunkedReviewPipeline(chunkedBaseInput);
+
+  const sandboxCalls = calls.filter((c) => c.kind === "test-generator");
+  assert.equal(sandboxCalls.length, 1);
+  assert.match(sandboxCalls[0]!.userText, /full-batch-ctx/);
+  assert.match(sandboxCalls[0]!.userText, /full-batch-diff/);
+});
+
+test("sizes each chunk's output token cap off that chunk's own file count, not the whole batch's", async () => {
+  resetState();
+
+  await runChunkedReviewPipeline({
+    ...chunkedBaseInput,
+    changedFiles: Array.from({ length: 20 }, (_, i) => `file${i}.ts`),
+    chunks: [
+      { label: "Chunk 1/2", changedFiles: ["only-one-file.ts"], astContext: "SMALL_CHUNK_CTX", diff: "d" },
+      {
+        label: "Chunk 2/2",
+        changedFiles: Array.from({ length: 20 }, (_, i) => `file${i}.ts`),
+        astContext: "BIG_CHUNK_CTX",
+        diff: "d",
+      },
+    ],
+  });
+
+  const smallChunkCalls = calls.filter((c) => c.kind !== "test-generator" && c.userText.includes("SMALL_CHUNK_CTX"));
+  const bigChunkCalls = calls.filter((c) => c.kind !== "test-generator" && c.userText.includes("BIG_CHUNK_CTX"));
+  assert.equal(smallChunkCalls.length, 2, "expected code-review + security-audit for the small chunk");
+  assert.equal(bigChunkCalls.length, 2, "expected code-review + security-audit for the big chunk");
+  for (const call of smallChunkCalls) {
+    assert.equal(call.maxOutputTokens, resolveMaxOutputTokens(1));
+  }
+  for (const call of bigChunkCalls) {
+    assert.equal(call.maxOutputTokens, resolveMaxOutputTokens(20));
+  }
+  assert.ok(
+    (bigChunkCalls[0]?.maxOutputTokens ?? 0) > (smallChunkCalls[0]?.maxOutputTokens ?? 0),
+    "the 20-file chunk should get a larger cap than the 1-file chunk",
+  );
+});
+
+test("processes chunks concurrently, bounded by MAX_CONCURRENT_CHUNKS, for a non-ollama provider", async () => {
+  resetState();
+  delaysMs = { "code-reviewer": 30, "security-auditor": 30 };
+  const chunks = Array.from({ length: 7 }, (_, i) => ({
+    label: `Chunk ${i + 1}/7`,
+    changedFiles: [`file${i}.ts`],
+    astContext: `CHUNK_${i}_CTX`,
+    diff: "d",
+  }));
+
+  await runChunkedReviewPipeline({ ...chunkedBaseInput, chunks });
+
+  assert.ok(maxObservedPersonaConcurrency > 1, "expected chunks to overlap in time, not run one at a time");
+  assert.ok(
+    maxObservedPersonaConcurrency <= MAX_CONCURRENT_CHUNKS,
+    `expected peak concurrent persona calls (${maxObservedPersonaConcurrency}) to stay within MAX_CONCURRENT_CHUNKS (${MAX_CONCURRENT_CHUNKS})`,
+  );
+});
+
+test("processes chunks strictly sequentially for the ollama provider, to avoid contending with its single local model process (GH #22)", async () => {
+  resetState();
+  delaysMs = { "code-reviewer": 20, "security-auditor": 20 };
+  const chunks = Array.from({ length: 4 }, (_, i) => ({
+    label: `Chunk ${i + 1}/4`,
+    changedFiles: [`file${i}.ts`],
+    astContext: `CHUNK_${i}_CTX`,
+    diff: "d",
+  }));
+
+  await runChunkedReviewPipeline({ ...chunkedBaseInput, provider: "ollama", chunks });
+
+  assert.equal(
+    maxObservedPersonaConcurrency,
+    1,
+    "expected at most one chunk's persona call in flight at a time for ollama",
+  );
+});
+
+test("a chunk failure aborts the concurrently in-flight sandbox-test call instead of leaving it to run unobserved", async (t) => {
+  resetState();
+  errorsAfterMs = { "code-reviewer": 5 };
+  hangUntilAborted = { "test-generator": true };
+  const messages: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+
+  const start = Date.now();
+  await assert.rejects(
+    runChunkedReviewPipeline({ ...chunkedBaseInput, chunks: [chunkedBaseInput.chunks[0]!] }),
+    /code-reviewer failed/,
+  );
+  const elapsed = Date.now() - start;
+
+  assert.ok(elapsed < 1000, `expected the aborted sandbox-test call to settle quickly, took ${elapsed}ms`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(
+    messages.some((m) => m.includes("sandbox-test failed") && m.includes("aborted")),
+    `expected the aborted sandbox-test failure to be logged, got: ${JSON.stringify(messages)}`,
+  );
+});
+
+test("a chunk failure stops the sequential (ollama) chunk loop from starting any remaining chunk", async () => {
+  resetState();
+  errorsAfterMs = { "code-reviewer": 5 };
+
+  await assert.rejects(
+    runChunkedReviewPipeline({ ...chunkedBaseInput, provider: "ollama" }),
+    /code-reviewer failed/,
+  );
+
+  // Two chunks were configured; the sequential ollama loop should never have
+  // attempted the second one once the first chunk's code-review call rejected.
+  const codeReviewerCalls = calls.filter((c) => c.kind === "code-reviewer");
+  assert.equal(codeReviewerCalls.length, 1, "the second chunk should never have started");
+});
+
+test("names the specific chunk in a truncation warning, via that chunk's own label", async (t) => {
+  resetState();
+  const messages: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+
+  await runChunkedReviewPipeline({
+    ...chunkedBaseInput,
+    chunks: [
+      {
+        label: "Chunk 1/1 (5 files) vs origin/main",
+        changedFiles: ["a.ts"],
+        astContext: "x".repeat(40_001),
+        diff: "d",
+      },
+    ],
+  });
+
+  const truncationWarnings = messages.filter(
+    (m) => m.includes("AST context") && m.includes("Chunk 1/1 (5 files) vs origin/main") && m.includes("truncated"),
+  );
+  assert.equal(truncationWarnings.length, 1, `expected the warning to name the chunk's own label, got: ${JSON.stringify(messages)}`);
 });
