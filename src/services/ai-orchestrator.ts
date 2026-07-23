@@ -5,11 +5,13 @@ import {
   type LanguageModel,
   type LanguageModelUsage,
   type ModelMessage,
+  type SystemModelMessage,
   type TextPart,
 } from "ai";
 import { loadPersonaPrompt, type PersonaPrompt } from "./prompt-loader.js";
 import { getModelId, type ProviderId } from "../utils/model-factory.js";
 import { runInSandbox, type SandboxResult } from "./sandbox.js";
+import { buildDynamicSkillInstructions } from "./skill-router.js";
 
 // Bounds how much file content and model output a single review can consume, so a
 // huge or generated input file can't blow up token cost or hang on context limits.
@@ -48,6 +50,11 @@ export interface ReviewInput {
   // review, without paying for a second resolution (and, for Ollama, a second
   // detection round-trip) here.
   model: LanguageModel;
+  // The actual file paths under review (a single-element array outside --diff
+  // mode), used only to route dynamic skill instructions by file type — see
+  // skill-router.ts. Distinct from `filePath`, which in --diff mode is a
+  // human-readable batch label ("N file(s) changed vs <target>"), not a path.
+  changedFiles: string[];
 }
 
 export interface SandboxTestOutcome {
@@ -186,14 +193,23 @@ async function runPersona(
   model: LanguageModel,
   provider: ProviderId,
   persona: PersonaPrompt,
+  additionalInstructions: string,
   stage: ReviewStage,
   userMessage: ModelMessage,
   abortSignal: AbortSignal,
 ): Promise<string> {
   const cacheControl = cacheControlProviderOptions(provider);
-  const system: Instructions = cacheControl
+  // The persona prompt is its own cache breakpoint, kept separate from the
+  // dynamic skill additions (see skill-router.ts) — those vary per diff, so
+  // folding them into the same string would tie the persona's cache hit rate
+  // to reviews repeatedly touching the same file-type categories, instead of
+  // any two reviews using the same persona regardless of what changed.
+  const basePart: SystemModelMessage = cacheControl
     ? { role: "system", content: persona.systemPrompt, providerOptions: cacheControl }
     : { role: "system", content: persona.systemPrompt };
+  const system: Instructions = additionalInstructions
+    ? [basePart, { role: "system", content: additionalInstructions }]
+    : basePart;
   let text: string;
   let usage: LanguageModelUsage;
   try {
@@ -257,6 +273,12 @@ export async function runReviewPipeline(
   // warning instead of one per call).
   const cacheableSection = buildCacheableSection(input);
 
+  // Routed strictly off the changed file paths (see skill-router.ts) so the
+  // review personas only get the specialized checks relevant to what's actually
+  // in the diff, instead of a fixed, ever-growing set of instructions that
+  // hallucinates concerns for file types that aren't present.
+  const dynamicSkills = buildDynamicSkillInstructions(input.changedFiles);
+
   // Shared across every call in this run: each call is independently bounded by
   // its own `timeout` (see REQUEST_TIMEOUT_MS), but this lets a failure in one
   // call cut the others short immediately too, instead of leaving them to run
@@ -287,6 +309,7 @@ export async function runReviewPipeline(
     model,
     input.provider,
     codeReviewer,
+    dynamicSkills.codeReviewerAdditions,
     "code-review",
     buildUserMessage(cacheableSection, input.provider),
     controller.signal,
@@ -320,6 +343,7 @@ export async function runReviewPipeline(
       model,
       input.provider,
       securityAuditor,
+      dynamicSkills.securityAuditorAdditions,
       "security-audit",
       buildUserMessage(cacheableSection, input.provider, codeReview),
       controller.signal,

@@ -28,16 +28,35 @@ function setupRepo(t: import("node:test").TestContext): string {
   writeFileSync(join(dir, "widget.tsx"), "export const Widget = () => null;\n");
   writeFileSync(join(dir, "notes.md"), "changed docs\n");
   writeFileSync(join(dir, "script.js"), "console.log('hi');\n");
+  writeFileSync(join(dir, "package.json"), '{"name":"example"}\n');
+  writeFileSync(join(dir, "next.config.js"), "module.exports = {};\n");
+  writeFileSync(join(dir, "migration.sql"), "ALTER TABLE users ADD COLUMN email TEXT;\n");
   git(dir, ["add", "."]);
   git(dir, ["commit", "-m", "feature work"]);
 
   return dir;
 }
 
-test("getChangedFiles returns only the changed .ts/.tsx files vs the target ref", (t) => {
+test("getChangedFiles returns the changed .ts/.tsx files vs the target ref", (t) => {
   const dir = setupRepo(t);
   const files = getChangedFiles("main", dir).sort();
-  assert.deepEqual(files, ["base.ts", "widget.tsx"]);
+  assert.deepEqual(files, [
+    "base.ts",
+    "migration.sql",
+    "next.config.js",
+    "package.json",
+    "widget.tsx",
+  ]);
+});
+
+test("getChangedFiles also keeps dynamic-skill trigger filenames (package.json, next.config.*, *.sql) that aren't .ts/.tsx, but still drops unrelated non-.ts files", (t) => {
+  const dir = setupRepo(t);
+  const files = getChangedFiles("main", dir);
+  assert.ok(files.includes("package.json"));
+  assert.ok(files.includes("next.config.js"));
+  assert.ok(files.includes("migration.sql"));
+  assert.ok(!files.includes("notes.md"));
+  assert.ok(!files.includes("script.js"));
 });
 
 test("getChangedFiles throws a friendly error for an unreachable target ref", (t) => {

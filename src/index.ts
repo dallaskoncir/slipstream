@@ -75,7 +75,7 @@ program
   .option("--repo <owner/repo>", "GitHub repo slug for --pr (defaults to the origin remote)")
   .option(
     "--diff <target>",
-    "review every changed .ts/.tsx file against this git ref (e.g. origin/main) as a single batch, instead of one file",
+    "review every changed .ts/.tsx file (plus package.json, next.config.*, and *.sql files) against this git ref (e.g. origin/main) as a single batch, instead of one file",
   )
   .addHelpText(
     "after",
@@ -136,6 +136,7 @@ program
       let diff = "";
       let reportMarkdown = "";
       let label: string;
+      let changedFiles: string[];
 
       if (options.diff) {
         let files: string[];
@@ -147,11 +148,12 @@ program
           return;
         }
         if (files.length === 0) {
-          clack.outro(`No changed .ts/.tsx files found vs ${options.diff}`);
+          clack.outro(`No changed files worth reviewing found vs ${options.diff}`);
           return;
         }
 
         label = `${files.length} file(s) changed vs ${options.diff}`;
+        changedFiles = files;
         const diffTarget = options.diff;
 
         await clack.tasks([
@@ -172,6 +174,7 @@ program
         ]);
       } else {
         label = file as string;
+        changedFiles = [label];
 
         await clack.tasks([
           {
@@ -196,7 +199,7 @@ program
           title: `Run AI review pipeline (${options.provider} / ${getModelId(model)})`,
           task: async (message) => {
             const result = await runReviewPipeline(
-              { filePath: label, astContext, diff, provider: options.provider, model },
+              { filePath: label, astContext, diff, provider: options.provider, model, changedFiles },
               (stage) => message(STAGE_MESSAGES[stage]),
             );
             reportMarkdown = buildReportMarkdown({

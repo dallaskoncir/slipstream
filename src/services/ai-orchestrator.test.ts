@@ -7,6 +7,8 @@ type Kind = "code-reviewer" | "security-auditor" | "test-generator";
 interface RecordedCall {
   kind: Kind;
   startedAt: number;
+  systemText: string;
+  systemPartCacheControl: boolean[];
   userText: string;
   hasSystemCacheControl: boolean;
   hasUserCacheControl: boolean;
@@ -14,11 +16,25 @@ interface RecordedCall {
   timeoutMs: number | undefined;
 }
 
+interface SystemPart {
+  content: string;
+  providerOptions?: unknown;
+}
+
 interface GenerateTextOpts {
-  system: string | { content: string; providerOptions?: unknown };
+  system: string | SystemPart | SystemPart[];
   messages: Array<{ content: Array<{ text: string; providerOptions?: unknown }> }>;
   abortSignal?: AbortSignal;
   timeout?: number;
+}
+
+// The persona's base prompt and the dynamic skill additions (skill-router.ts)
+// are sent as separate system parts (an array) so the base prompt keeps its
+// own cache breakpoint — see the comment on basePart in runPersona(). Tests
+// below work with the combined text/cache-control state across every part.
+function systemParts(system: GenerateTextOpts["system"]): SystemPart[] {
+  if (typeof system === "string") return [{ content: system }];
+  return Array.isArray(system) ? system : [system];
 }
 
 const FIXED_USAGE = {
@@ -51,7 +67,7 @@ function resetState(): void {
 }
 
 function classify(system: GenerateTextOpts["system"]): Kind {
-  const text = typeof system === "string" ? system : system.content;
+  const text = systemParts(system)[0]?.content ?? "";
   if (text === "CODE_REVIEWER_SYSTEM") return "code-reviewer";
   if (text === "SECURITY_AUDITOR_SYSTEM") return "security-auditor";
   return "test-generator";
@@ -71,11 +87,14 @@ mock.module("ai", {
     APICallError,
     generateText: async (opts: GenerateTextOpts) => {
       const kind = classify(opts.system);
+      const parts = systemParts(opts.system);
       calls.push({
         kind,
         startedAt: Date.now(),
+        systemText: parts.map((part) => part.content).join("\n\n"),
+        systemPartCacheControl: parts.map((part) => part.providerOptions !== undefined),
         userText: opts.messages[0]?.content.map((part) => part.text).join("") ?? "",
-        hasSystemCacheControl: typeof opts.system !== "string" && opts.system.providerOptions !== undefined,
+        hasSystemCacheControl: parts.some((part) => part.providerOptions !== undefined),
         hasUserCacheControl: opts.messages[0]?.content[0]?.providerOptions !== undefined,
         hasAbortSignal: opts.abortSignal instanceof AbortSignal,
         timeoutMs: opts.timeout,
@@ -152,6 +171,7 @@ const baseInput = {
   diff: "diff",
   provider: "anthropic" as const,
   model: { modelId: "mock-model" } as unknown as import("ai").LanguageModel,
+  changedFiles: ["example.ts"],
 };
 
 test("returns the codeReview/securityAudit/sandboxTest shape assembled from all three passes", async () => {
@@ -375,4 +395,66 @@ test("warns on stderr when the AST context or diff is truncated, instead of sile
     `expected exactly one truncation warning (the AST/diff block is built once per run and reused ` +
       `across all three model calls), got: ${JSON.stringify(messages)}`,
   );
+});
+
+test("injects React/Performance instructions into the code-reviewer prompt for frontend files, and nothing into security-auditor", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: ["src/app/page.tsx"] });
+
+  const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
+  assert.match(byKind["code-reviewer"]!.systemText, /Dynamic Skill: React Architecture & Performance Auditor/);
+  assert.doesNotMatch(byKind["security-auditor"]!.systemText, /Dynamic Skill/);
+});
+
+test("injects Type Wizard into code-reviewer and Backend Security Auditor into security-auditor for backend/data files", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: ["src/app/api/route.ts"] });
+
+  const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
+  assert.match(byKind["code-reviewer"]!.systemText, /Dynamic Skill: Type Wizard/);
+  assert.match(byKind["security-auditor"]!.systemText, /Dynamic Skill: Backend Security Auditor/);
+});
+
+test("injects Dependency & Environment Auditor into security-auditor for config files, and nothing into code-reviewer", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: ["package.json"] });
+
+  const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
+  assert.doesNotMatch(byKind["code-reviewer"]!.systemText, /Dynamic Skill/);
+  assert.match(byKind["security-auditor"]!.systemText, /Dynamic Skill: Dependency & Environment Auditor/);
+});
+
+test("injects nothing when no changed file matches a dynamic skill category", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: ["src/services/example.ts"] });
+
+  const byKind = Object.fromEntries(calls.map((c) => [c.kind, c]));
+  assert.doesNotMatch(byKind["code-reviewer"]!.systemText, /Dynamic Skill/);
+  assert.doesNotMatch(byKind["security-auditor"]!.systemText, /Dynamic Skill/);
+});
+
+test("keeps the persona's base prompt as its own cache breakpoint, separate from the dynamic skill additions", async () => {
+  resetState();
+
+  await runReviewPipeline({ ...baseInput, changedFiles: ["src/app/page.tsx"] });
+
+  // The base persona prompt (part 0) is cache-controlled independently of
+  // whatever dynamic additions get appended; the additions themselves (part 1)
+  // vary per diff, so they're sent as plain, uncached text instead of paying a
+  // cache-write cost for content unlikely to be reused across runs.
+  const codeReviewer = calls.find((c) => c.kind === "code-reviewer")!;
+  assert.deepEqual(codeReviewer.systemPartCacheControl, [true, false]);
+});
+
+test("keeps the persona system prompt as a single cache-controlled part when no dynamic skill category is triggered", async () => {
+  resetState();
+
+  await runReviewPipeline(baseInput);
+
+  const codeReviewer = calls.find((c) => c.kind === "code-reviewer")!;
+  assert.deepEqual(codeReviewer.systemPartCacheControl, [true]);
 });
