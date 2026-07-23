@@ -113,6 +113,39 @@ Expand the AI orchestration layer beyond Anthropic and Ollama to also support Op
 7. Verify `npm run typecheck`, `npm run build`, and `npm test` pass, and manually confirm `scrutineer review <file> --provider openai` and `--provider gemini` both complete a real review.
 8. Push the branch and open a PR per the standard workflow.
 
+## Phase 11: Model Configurability & Intelligent Defaults
+
+Allow users to specify the exact foundation model they want to use via the CLI, accommodating different reasoning capabilities and cost preferences.
+
+1. Create a new branch for Phase 11.
+2. Add a `-m, --model <name>` flag to the `commander` configuration.
+3. Implement intelligent defaults based on the active `--provider`. If the user omits the `--model` flag, fallback to:
+   - `anthropic` -> `claude-3-5-sonnet-latest`
+   - `openai` -> `gpt-4o`
+   - `google` -> `gemini-1.5-pro`
+   - `ollama` -> `qwen2.5-coder`
+4. Pass the resolved model string into the Model Factory.
+5. Ensure the CLI prints which provider and model are currently being used when starting the review, so the user has immediate feedback.
+6. Document the `--model` flag in the README.
+7. Verify `npm run typecheck`, `npm run build`, and `npm test` pass.
+8. Push the branch and open a PR per the standard workflow.
+
+## Phase 12: Dynamic Skill Routing (Context-Aware Personas)
+
+Prevent LLM hallucination and context-window bloat by dynamically composing the agent swarm's system prompt and skills based strictly on the file types present in the Git diff.
+
+1. Create a new branch for Phase 12.
+2. Read the array of changed files produced by the `--diff` execution.
+3. If the diff contains UI/frontend files (e.g., `page.tsx`, `layout.tsx`, `components/`):
+   - Load and inject "React Architecture" and "Performance Auditor" instructions (e.g., checking for stale closures, prop drilling, unoptimized images).
+4. If the diff contains backend/data files (e.g., `route.ts`, `schema.ts`, `prisma/`, `*.sql`):
+   - Load and inject "Type Wizard" and "Security Auditor" instructions (e.g., catching `any` assertions, unvalidated Zod payloads, raw SQL queries).
+5. If the diff contains configuration (e.g., `package.json`, `next.config.ts`):
+   - Inject dependency and environment variable auditing instructions.
+6. Construct the final system prompt by concatenating the base Scrutineer instructions with only the triggered specialized personas.
+7. Verify `npm run typecheck`, `npm run build`, and `npm test` pass.
+8. Push the branch and open a PR per the standard workflow.
+
 ## Agent Skills Policy
 Use agent skills library selectively, keeping the context window focused:
 - **Match the Skill to the Task**: Pick whichever installed skill best fits the work at hand rather than following a fixed branch-to-skill mapping.
