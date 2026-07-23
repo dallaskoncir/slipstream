@@ -70,7 +70,7 @@ Scrutineer reads all credentials and overrides from environment variables in wha
 | `SCRUTINEER_MODEL_ANTHROPIC` | No | Overrides the default Anthropic model (`claude-sonnet-5`). |
 | `SCRUTINEER_MODEL_OLLAMA` | No | Overrides the default Ollama model (auto-detected from what's running locally, falling back to `phi4`). |
 | `SCRUTINEER_MODEL_OPENAI` | No | Overrides the default OpenAI model (`gpt-4o-mini`). |
-| `SCRUTINEER_MODEL_GEMINI` | No | Overrides the default Gemini model (`gemini-flash-latest`). |
+| `SCRUTINEER_MODEL_GEMINI` | No | Overrides the default Gemini model (`gemini-flash-lite-latest`). |
 
 **Local shell** — export vars directly, or drop them in a `.env` file (copy `.env.example` to `.env` and fill it in):
 

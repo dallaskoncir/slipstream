@@ -12,7 +12,7 @@ const DEFAULT_MODEL_ID: Record<ProviderId, string> = {
   anthropic: "claude-sonnet-5",
   ollama: "phi4",
   openai: "gpt-4o-mini",
-  gemini: "gemini-flash-latest",
+  gemini: "gemini-flash-lite-latest",
 };
 
 // Scoped per provider so an override set for one provider (e.g. a pinned Anthropic

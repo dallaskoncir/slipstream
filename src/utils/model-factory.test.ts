@@ -75,7 +75,7 @@ test("createModel(openai) respects SCRUTINEER_MODEL_OPENAI", async (t) => {
 test("createModel(gemini) uses the default model ID with no override", async (t) => {
   withEnv(t, "SCRUTINEER_MODEL_GEMINI", undefined);
   const model = await createModel("gemini");
-  assert.equal(modelId(model), "gemini-flash-latest");
+  assert.equal(modelId(model), "gemini-flash-lite-latest");
 });
 
 test("createModel(gemini) respects SCRUTINEER_MODEL_GEMINI", async (t) => {
