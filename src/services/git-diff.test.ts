@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getChangedFiles, getDiffAgainstTarget } from "./git-diff.js";
+import { MAX_SECTION_CHARS } from "./ai-orchestrator.js";
 
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd });
@@ -128,6 +129,49 @@ test("getDiffAgainstTarget returns just the lockfile stat summary when only lock
   assert.match(diff, /pnpm-lock\.yaml/);
   assert.match(diff, /yarn\.lock/);
   assert.doesNotMatch(diff, /lockfileVersion/);
+});
+
+test("getDiffAgainstTarget keeps a code change intact under MAX_SECTION_CHARS even alongside a lockfile diff that would blow the budget on its own (GH #31)", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "scrutineer-git-diff-lockfile-budget-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  git(dir, ["init", "-b", "main"]);
+  git(dir, ["config", "user.email", "test@example.com"]);
+  git(dir, ["config", "user.name", "Test"]);
+
+  writeFileSync(join(dir, "app.ts"), "export const app = 1;\n");
+  writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-m", "base"]);
+
+  git(dir, ["checkout", "-b", "feature"]);
+  writeFileSync(join(dir, "app.ts"), "export const app = 2;\n");
+  // A synthetic but realistic lockfile diff (thousands of dependency-version
+  // lines), reproducing the exact scenario from issue #31: a transitive
+  // dependency bump large enough that its raw diff body, on its own, would
+  // exceed MAX_SECTION_CHARS and could push the real code change out of what
+  // the model ever sees once ai-orchestrator.ts truncates the combined string.
+  const lockfileLines = Array.from({ length: 3000 }, (_, i) => `dependency-${i}: ^1.0.${i}`);
+  const rawLockfileBodyLength = lockfileLines.join("\n").length;
+  assert.ok(
+    rawLockfileBodyLength > MAX_SECTION_CHARS,
+    "test setup sanity check: the raw lockfile content must exceed MAX_SECTION_CHARS on its own",
+  );
+  writeFileSync(join(dir, "pnpm-lock.yaml"), `${lockfileLines.join("\n")}\n`);
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-m", "bump a transitive dependency"]);
+
+  const diff = getDiffAgainstTarget("main", ["app.ts", "pnpm-lock.yaml"], dir);
+
+  assert.ok(
+    diff.length < MAX_SECTION_CHARS,
+    `expected the combined diff (${diff.length} chars) to stay under MAX_SECTION_CHARS ` +
+      `(${MAX_SECTION_CHARS}) so ai-orchestrator.ts never has to truncate it — got a diff that ` +
+      "would have been over budget before this fix",
+  );
+  assert.match(diff, /-export const app = 1;/);
+  assert.match(diff, /\+export const app = 2;/);
+  assert.doesNotMatch(diff, /dependency-0:/);
 });
 
 test("getDiffAgainstTarget scrubs values that look like secrets", (t) => {

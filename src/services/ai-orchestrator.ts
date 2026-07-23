@@ -15,7 +15,10 @@ import { buildDynamicSkillInstructions } from "./skill-router.js";
 
 // Bounds how much file content and model output a single review can consume, so a
 // huge or generated input file can't blow up token cost or hang on context limits.
-const MAX_SECTION_CHARS = 40_000;
+// Exported so git-diff.test.ts can assert its lockfile-vs-code-diff budget test
+// (issue #31) against the real, current value instead of a duplicated constant
+// that could silently drift out of sync.
+export const MAX_SECTION_CHARS = 40_000;
 const MAX_OUTPUT_TOKENS = 4096;
 
 // Bounds every model call on its own, so a broken provider (bad key, unreachable
