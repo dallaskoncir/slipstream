@@ -139,6 +139,43 @@ function cacheControlProviderOptions(
   return provider === "anthropic" ? { anthropic: { cacheControl: { type: "ephemeral" } } } : undefined;
 }
 
+// The other provider-aware decision in this file, alongside prompt caching
+// above (see ADR-0001): whether independent generateText calls against a
+// given provider can safely overlap in time. Ollama serves a single local
+// model process, and a concurrent call against it was observed to
+// intermittently return a bare 400 while another call was already in flight
+// (GH #22); every other provider handles independent concurrent requests
+// fine. Both scheduleSandboxTest below and runChunkedReviewPipeline's
+// chunk-dispatch mode consult this one predicate instead of each re-deriving
+// their own `provider !== "ollama"` check (issue #37).
+function providerAllowsConcurrentCalls(provider: ProviderId): boolean {
+  return provider !== "ollama";
+}
+
+// Shared by runReviewPipeline and runChunkedReviewPipeline: the sandbox-test
+// call only depends on the AST context/diff, not on either persona's
+// findings, so it can start concurrently with the persona chain for
+// providers that allow that (see providerAllowsConcurrentCalls) — or must
+// wait until the chain has resolved otherwise. `start` is the caller's own
+// thunk (single-batch vs whole-batch content differs between the two
+// pipelines); this only owns the "now, or after the chain" decision, and
+// makes that start idempotent so a caller can unconditionally call
+// ensureStarted() again later without kicking off a second call.
+function scheduleSandboxTest(
+  provider: ProviderId,
+  start: () => Promise<SandboxTestOutcome>,
+): { concurrent: boolean; ensureStarted: (onFirstStart: () => void) => Promise<SandboxTestOutcome> } {
+  let promise: Promise<SandboxTestOutcome> | undefined;
+  function ensureStarted(onFirstStart: () => void): Promise<SandboxTestOutcome> {
+    if (!promise) {
+      onFirstStart();
+      promise = start();
+    }
+    return promise;
+  }
+  return { concurrent: providerAllowsConcurrentCalls(provider), ensureStarted };
+}
+
 function buildCacheableSection(input: ReviewInput): string {
   return [
     `# File under review: ${input.filePath}`,
@@ -413,17 +450,12 @@ export async function runReviewPipeline(
     maxOutputTokens,
   );
 
-  // generateSandboxTest only depends on the AST context + diff, not on either
-  // persona's findings, so for anthropic (independent per-call API requests) it
-  // runs concurrently with the review chain above instead of after it. Ollama
-  // instead serves one local model process; a concurrent generateText call against
-  // that same model contends with the review chain's calls and was observed to
-  // intermittently return a bare 400 (GH #22), so ollama keeps the pre-Phase-7
-  // sequential order (started further below, once the chain has resolved).
-  let sandboxTestPromise: Promise<SandboxTestOutcome> | undefined;
-  if (input.provider !== "ollama") {
-    onProgress?.("sandbox-test");
-    sandboxTestPromise = startSandboxTest();
+  // See scheduleSandboxTest: starts concurrently with the review chain above
+  // for providers that allow it, or waits until the chain resolves further
+  // below otherwise.
+  const sandboxScheduler = scheduleSandboxTest(input.provider, startSandboxTest);
+  if (sandboxScheduler.concurrent) {
+    sandboxScheduler.ensureStarted(() => onProgress?.("sandbox-test"));
   }
 
   const codeReview = await withAbortOnFailure(controller, () => codeReviewPromise);
@@ -442,12 +474,7 @@ export async function runReviewPipeline(
     ),
   );
 
-  if (!sandboxTestPromise) {
-    onProgress?.("sandbox-test");
-    sandboxTestPromise = startSandboxTest();
-  }
-
-  const sandboxTest = await sandboxTestPromise;
+  const sandboxTest = await sandboxScheduler.ensureStarted(() => onProgress?.("sandbox-test"));
 
   return {
     codeReview,
@@ -678,24 +705,16 @@ export async function runChunkedReviewPipeline(
     return promise;
   }
 
-  // Same ollama-vs-other-providers split as runReviewPipeline: a concurrent
-  // generateText call against ollama's single local model process contends
-  // with the chunk calls and was observed to intermittently fail (GH #22).
-  // Mirrors runReviewPipeline's pre-existing provider branching rather than
-  // centralizing it — ADR-0001 states orchestration code shouldn't branch on
-  // provider, but runReviewPipeline already does exactly this (since the
-  // GH #22 fix, before issue #35), so this isn't a new divergence introduced
-  // here. Centralizing provider-aware scheduling across both functions is a
-  // reasonable follow-up, tracked separately (issue #37) rather than folded
-  // into this fix.
-  let sandboxTestPromise: Promise<SandboxTestOutcome> | undefined;
-  if (input.provider !== "ollama") {
-    onProgress?.({ stage: "sandbox-test" });
-    sandboxTestPromise = startSandboxTest();
+  // See scheduleSandboxTest: same provider-aware decision runReviewPipeline
+  // uses, centralized in one place rather than each pipeline re-deriving its
+  // own `provider !== "ollama"` check (issue #37).
+  const sandboxScheduler = scheduleSandboxTest(input.provider, startSandboxTest);
+  if (sandboxScheduler.concurrent) {
+    sandboxScheduler.ensureStarted(() => onProgress?.({ stage: "sandbox-test" }));
   }
 
   const chunkResults = await withAbortOnFailure(controller, async () => {
-    if (input.provider === "ollama") {
+    if (!providerAllowsConcurrentCalls(input.provider)) {
       const results: ChunkReviewPair[] = [];
       for (let i = 0; i < input.chunks.length; i++) {
         results.push(await runChunkReviewPair(input.chunks[i] as ReviewChunk, i));
@@ -710,12 +729,7 @@ export async function runChunkedReviewPipeline(
     );
   });
 
-  if (!sandboxTestPromise) {
-    onProgress?.({ stage: "sandbox-test" });
-    sandboxTestPromise = startSandboxTest();
-  }
-
-  const sandboxTest = await sandboxTestPromise;
+  const sandboxTest = await sandboxScheduler.ensureStarted(() => onProgress?.({ stage: "sandbox-test" }));
 
   function aggregate(sectionOf: (result: ChunkReviewPair) => string): string {
     return chunkResults
